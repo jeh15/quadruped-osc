@@ -16,7 +16,7 @@ from mujoco.mjx._src.types import Data
 from mujoco.mjx._src.types import Model
 
 
-jax.config.update('jax_enable_x64', True)
+jax.config.update('jax_disable_jit', False)
 
 
 def mj_jacobian(
@@ -173,37 +173,42 @@ def mj_finite_difference_jacobian(
 def main(argv):
     xml_path = os.path.join(
         os.path.dirname(__file__),
-        'models/unitree_go2/scene_mjx.xml',
+        'models/double_pendulum/double_pendulum.xml',
     )
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
-    q_init = jnp.asarray(mj_model.keyframe('home').qpos)
-    qd_init = jnp.asarray(mj_model.keyframe('home').qvel)
-    default_ctrl = jnp.asarray(mj_model.keyframe('home').ctrl)
+    mj_data = mujoco.MjData(mj_model)
 
-    feet_site = [
-        'front_left_foot',
-        'front_right_foot',
-        'hind_left_foot',
-        'hind_right_foot',
-    ]
-    feet_site_ids = [
-        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE.value, f)
-        for f in feet_site
-    ]
-    feet_ids = jnp.asarray(feet_site_ids)
+    q_init = jnp.array([jnp.pi / 2.0])
+    qd_init = jnp.array([0.0])
+    default_ctrl = jnp.array([1.0])
 
-    calf_body = [
-            'front_left_calf',
-            'front_right_calf',
-            'hind_left_calf',
-            'hind_right_calf',
-        ]
-    calf_body_ids = [
-        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY.value, c)
-        for c in calf_body
+    mj_data.qpos = q_init
+    mj_data.qvel = qd_init
+    mj_data.ctrl = default_ctrl
+
+    mujoco.mj_step(mj_model, mj_data)
+
+    jp = np.zeros((3, mj_model.nv))
+    jr = np.zeros((3, mj_model.nv))
+
+    ee_site = [
+        'end_effector',
     ]
-    calf_ids = jnp.asarray(calf_body_ids)
+    ee_site_ids = [
+        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE.value, e)
+        for e in ee_site
+    ]
+    ee_ids = jnp.asarray(ee_site_ids)
+
+    pendulum_body = [
+        'pole',
+    ]
+    pendulum_body_ids = [
+        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY.value, p)
+        for p in pendulum_body
+    ]
+    pendulum_ids = jnp.asarray(pendulum_body_ids)
 
     # MJX Model:
     model = mjx.put_model(mj_model)
@@ -234,34 +239,54 @@ def main(argv):
         J = data.efc_J[data.contact.efc_address]
 
         # Task Space Jacobians:
-        point = data.site_xpos[feet_ids] - data.xpos[calf_ids]
+        point = data.site_xpos[ee_ids] - data.xpos[pendulum_ids]
         jacp, jacr = jax.vmap(mj_jacobian, in_axes=(None, None, 0, 0))(
-            model, data, point, calf_ids,
+            model, data, point, pendulum_ids,
         )
         Jv = jnp.reshape(
             jnp.concatenate([jacp, jacr], axis=-1),
-            shape=(calf_ids.shape[0], 6, -1),
+            shape=(pendulum_ids.shape[0], 6, -1),
         )
-        dJv = mj_finite_difference_jacobian(model, data, calf_ids, feet_ids)
+        dJv = mj_finite_difference_jacobian(model, data, pendulum_ids, ee_ids)
         Jv_bias = dJv @ data.qvel
 
-        # Mujoco jacDot Test:
+        # Different ways to calculate the Jacobian: (THIS IS THE CORRECT WAY)
+        # MJX Jacobian:
+        point = data.site_xpos[ee_ids] - data.xpos[pendulum_ids]
+        jacp, jacr = jax.vmap(mj_jacobian, in_axes=(None, None, 0, 0))(
+            model, data, point, pendulum_ids,
+        )
+        J_global = jnp.reshape(
+            jnp.concatenate([jacp, jacr], axis=-1),
+            shape=(pendulum_ids.shape[0], 6, -1),
+        )
+        # Mujoco Jacobian:
+        mujoco.mj_jac(mj_model, mj_data, jp, jr, np.squeeze(point), pendulum_ids[0])
+        J_mujoco = np.concatenate([jp, jr])
+        # Analytical Jacobian:
+        jacp, jacr = jax.vmap(mj_jacobian, in_axes=(None, None, 0, 0))(
+            model, data, point, pendulum_ids,
+        )
+        J_calc = jnp.array(
+            [0.6 * jnp.cos(data.qpos[0]), 0.0, -0.6 * jnp.sin(data.qpos[0])]
+        )
+
+        # Compare JDot:
+        JDot_mjx = mj_finite_difference_jacobian(model, data, pendulum_ids, ee_ids)
         jp = np.zeros((3, mj_model.nv))
         jr = np.zeros((3, mj_model.nv))
 
-        # Make Data:
-        mj_data = mujoco.MjData(mj_model)
-        mj_data.qpos = np.squeeze(data.qpos)
-        mj_data.qvel = np.squeeze(data.qvel)
-        mj_data.ctrl = np.squeeze(data.ctrl)
+        # Pipeline Stages:
+        mj_data.ctrl = 10.0
+        mujoco.mj_kinematics(mj_model, mj_data)
+        mujoco.mj_comPos(mj_model, mj_data)
+        mujoco.mj_comVel(mj_model, mj_data)
 
-        # Step:
-        mujoco.mj_step(mj_model, mj_data)
-        point = mj_data.site_xpos[feet_site_ids] - mj_data.xpos[calf_body_ids]
+        point = mj_data.site_xpos[ee_ids] - mj_data.xpos[pendulum_ids]
 
-        mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point[0]), calf_body_ids[0])
+        mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point), pendulum_ids[0])
+        JDot_mujoco = np.concatenate([jp, jr])
 
-        dJv_mujoco = np.concatenate([jp, jr])
         pass
 
 
