@@ -170,6 +170,32 @@ def mj_finite_difference_jacobian(
     return jnp.reshape((jac_eps - jac) / eps, shape=(body_ids.shape[0], 6, -1))
 
 
+def mj_jacobian_dot(
+    m: Model,
+    d: Data,
+    point: jax.Array,
+    body_id: jax.Array,
+) -> jax.Array:
+    """Compute pair of (NV, 3) Jacobians of global point attached to body."""
+    fn = lambda carry, b: b if carry is None else b + carry
+    mask = (jnp.arange(m.nbody) == body_id) * 1
+    mask = scan.body_tree(m, fn, 'b', 'b', mask, reverse=True)
+    mask = mask[jnp.array(m.dof_bodyid)] > 0
+
+    offset = point - d.subtree_com[jnp.array(m.body_rootid)[body_id]]
+
+    cdof_dot = d.cdof_dot
+    jtype = m.jnt_type
+    jnt_fn = lambda carry, jnt: 
+
+
+    jacp = jax.vmap(lambda a, b=offset: a[3:] + jnp.cross(a[:3], b))(d.cdof)
+    jacp = jax.vmap(jnp.multiply)(jacp, mask)
+    jacr = jax.vmap(jnp.multiply)(d.cdof[:, :3], mask)
+
+    return jacp, jacr
+
+
 def main(argv):
     xml_path = os.path.join(
         os.path.dirname(__file__),
@@ -243,6 +269,7 @@ def main(argv):
         jacp, jacr = jax.vmap(mj_jacobian, in_axes=(None, None, 0, 0))(
             model, data, point, pendulum_ids,
         )
+        mj_jacobian_dot(model, data, point, pendulum_ids[0])
         Jv = jnp.reshape(
             jnp.concatenate([jacp, jacr], axis=-1),
             shape=(pendulum_ids.shape[0], 6, -1),

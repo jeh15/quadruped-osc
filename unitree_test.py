@@ -147,7 +147,8 @@ def main(argv):
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
     q_init = jnp.asarray(mj_model.keyframe('home').qpos)
-    qd_init = jnp.asarray(mj_model.keyframe('home').qvel)
+    qd_init = np.asarray(mj_model.keyframe('home').qvel)
+    qd_init[2] = 0.1
     default_ctrl = jnp.asarray(mj_model.keyframe('home').ctrl)
 
     feet_site = [
@@ -178,83 +179,69 @@ def main(argv):
     model = mjx.put_model(mj_model)
     data = mjx.make_data(model)
 
-    # Initialize State:
+    # Initialize MJX Data:
     data = data.replace(qpos=q_init, qvel=qd_init, ctrl=default_ctrl)
-    data = mjx.forward(model, data)
 
-    # JIT Functions:
-    step_fn = jax.jit(mjx.step)
+    # Initialize Mujoco Data:
+    mj_data = mujoco.MjData(mj_model)
+    mj_data.qpos = q_init
+    mj_data.qvel = qd_init
+    mj_data.ctrl = default_ctrl
 
-    num_steps = 500
-    for i in range(num_steps):
-        data = data.replace(ctrl=default_ctrl)
-        data = step_fn(model, data)
+    """ mj_jacDot Test:"""
+    # Minimial MJX Pipeline:
+    data = mjx.kinematics(model, data)
+    data = mjx.com_pos(model, data)
+    data = mjx.com_vel(model, data)
 
-        # Dynamics Equation: M @ dv + C = B @ u + J.T @ f
-        # Task Space  Objective: ddx_task = vJ @ dv + vJ_bias
+    # Minimal Mujoco Pipeline:
+    mujoco.mj_kinematics(mj_model, mj_data)
+    mujoco.mj_comPos(mj_model, mj_data)
+    mujoco.mj_comVel(mj_model, mj_data)
 
-        # Mass Matrix:
-        M = data.qM
+    # Compare Jacobian Dot:
+    # MJX:
+    point = (data.site_xpos[feet_ids] - data.xpos[calf_ids])[0]
+    body_id = calf_ids[0]
+    jacp, jacr = mj_jacobian_dot(model, data, jnp.squeeze(point), body_id)
+    dJ_mjx = np.concatenate([jacp.T, jacr.T])
 
-        # Coriolis and Gravity:
-        C = data.qfrc_bias
+    # Mujoco:
+    jp = np.zeros((3, mj_model.nv))
+    jr = np.zeros((3, mj_model.nv))
+    mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point), body_id)
+    dJ_mujoco = np.concatenate([jp, jr])
 
-        # Contact Jacobian:
-        J = data.efc_J[data.contact.efc_address]
+    # Compare:
+    np.isclose(dJ_mjx, dJ_mujoco, atol=1e-6, rtol=1e-6)
 
-        # Testing this:
-        point = data.site_xpos[feet_ids] - data.xpos[calf_ids]
-        # jacp, jacr = mj_jacobian_dot(model, data, point[0], calf_ids[0])
+    # Compare Jacobian:
+    # MJX:
+    jacp, jacr = mj_jacobian(model, data, jnp.squeeze(point), body_id)
+    J_mjx = np.concatenate([jacp.T, jacr.T])
 
-        # Mujoco jacDot Test:
-        jp = np.zeros((3, mj_model.nv))
-        jr = np.zeros((3, mj_model.nv))
+    # Mujoco:
+    jp = np.zeros((3, mj_model.nv))
+    jr = np.zeros((3, mj_model.nv))
+    mujoco.mj_jac(mj_model, mj_data, jp, jr, np.squeeze(point), body_id)
+    J_mujoco = np.concatenate([jp, jr])
 
-        # Make Data:
-        mj_data = mujoco.MjData(mj_model)
-        mj_data.qpos = np.squeeze(data.qpos)
-        mj_data.qvel = np.squeeze(data.qvel)
-        mj_data.ctrl = np.squeeze(data.ctrl)
+    # Compare:
+    np.isclose(J_mjx, J_mujoco, atol=1e-6, rtol=1e-6)
 
-        # Step:
-        mujoco.mj_step(mj_model, mj_data)
-        point = mj_data.site_xpos[feet_site_ids] - mj_data.xpos[calf_body_ids]
+    pass
 
-        mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point[0]), calf_body_ids[0])
+    # Dynamics Equation: M @ dv + C = B @ u + J.T @ f
+    # Task Space  Objective: ddx_task = vJ @ dv + vJ_bias
 
-        new_data = mjx.put_data(mj_model, mj_data)
-        jacp, jacr = mj_jacobian_dot(model, new_data, point[0], calf_ids[0])
+    # Mass Matrix:
+    M = data.qM
 
-        # Task Space Jacobians:
-        point = data.site_xpos[feet_ids] - data.xpos[calf_ids]
-        jacp, jacr = jax.vmap(mj_jacobian, in_axes=(None, None, 0, 0))(
-            model, data, point, calf_ids,
-        )
-        Jv = jnp.reshape(
-            jnp.concatenate([jacp, jacr], axis=-1),
-            shape=(calf_ids.shape[0], 6, -1),
-        )
-        dJv = mj_finite_difference_jacobian(model, data, calf_ids, feet_ids)
-        Jv_bias = dJv @ data.qvel
+    # Coriolis and Gravity:
+    C = data.qfrc_bias
 
-        # Mujoco jacDot Test:
-        jp = np.zeros((3, mj_model.nv))
-        jr = np.zeros((3, mj_model.nv))
-
-        # Make Data:
-        mj_data = mujoco.MjData(mj_model)
-        mj_data.qpos = np.squeeze(data.qpos)
-        mj_data.qvel = np.squeeze(data.qvel)
-        mj_data.ctrl = np.squeeze(data.ctrl)
-
-        # Step:
-        mujoco.mj_step(mj_model, mj_data)
-        point = mj_data.site_xpos[feet_site_ids] - mj_data.xpos[calf_body_ids]
-
-        mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point[0]), calf_body_ids[0])
-
-        dJv_mujoco = np.concatenate([jp, jr])
-        pass
+    # Contact Jacobian:
+    J = data.efc_J[data.contact.efc_address]
 
 
 if __name__ == '__main__':
