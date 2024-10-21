@@ -3,12 +3,17 @@ from absl import app
 import os
 import functools
 
+import time
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from flax import struct
+
 import mujoco
 from mujoco import mjx
+from brax.mjx import pipeline
 
 # MJX Utilities:
 from mujoco.mjx._src import scan
@@ -36,8 +41,7 @@ def mj_jacobian(
     jacp = jax.vmap(jnp.multiply)(jacp, mask)
     jacr = jax.vmap(jnp.multiply)(d.cdof[:, :3], mask)
 
-    # Make sure to transpose these after...
-    return jacp, jacr
+    return jacp.T, jacr.T
 
 
 def mj_jacobian_dot(
@@ -135,8 +139,7 @@ def mj_jacobian_dot(
     jacp = jax.vmap(jnp.multiply)(jacp, mask)
     jacr = jax.vmap(jnp.multiply)(cdof_dot[:, :3], mask)
 
-    # Make sure to transpose these after...
-    return jacp, jacr
+    return jacp.T, jacr.T
 
 
 def main(argv):
@@ -147,7 +150,7 @@ def main(argv):
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
     q_init = jnp.asarray(mj_model.keyframe('home').qpos)
-    qd_init = jnp.asarray(mj_model.keyframe('home').qvel)
+    qd_init = np.asarray(mj_model.keyframe('home').qvel)
     default_ctrl = jnp.asarray(mj_model.keyframe('home').ctrl)
 
     feet_site = [
@@ -178,83 +181,67 @@ def main(argv):
     model = mjx.put_model(mj_model)
     data = mjx.make_data(model)
 
-    # Initialize State:
+    # Initialize MJX Data:
     data = data.replace(qpos=q_init, qvel=qd_init, ctrl=default_ctrl)
-    data = mjx.forward(model, data)
 
     # JIT Functions:
-    step_fn = jax.jit(mjx.step)
+    init_fn = jax.jit(pipeline.init)
+    step_fn = jax.jit(pipeline.step)
 
-    num_steps = 500
-    for i in range(num_steps):
-        data = data.replace(ctrl=default_ctrl)
-        data = step_fn(model, data)
+    # OSC Data Struct:
+    @struct.dataclass
+    class OSCData:
+        mass_matrix: jax.Array
+        coriolis_matrix: jax.Array
+        contact_jacobian: jax.Array
+        taskspace_jacobian: jax.Array
+        taskspace_bias: jax.Array
 
-        # Dynamics Equation: M @ dv + C = B @ u + J.T @ f
-        # Task Space  Objective: ddx_task = vJ @ dv + vJ_bias
+    # Step Function:
+    def loop(carry: jax.Array, xs: None) -> Tuple[jax.Array, OSCData]:
+        state = carry
+        state = step_fn(model, state, default_ctrl)
 
-        # Mass Matrix:
-        M = data.qM
+        # OSC Data:
+        mass_matrix = state.qM
+        coriolis_matrix = state.qfrc_bias
+        contact_jacobian = state.efc_J[state.contact.efc_address]
+        points = state.site_xpos[feet_ids] - state.xpos[calf_ids]
+        jacp_dot, jacr_dot = jax.vmap(
+            mj_jacobian_dot, in_axes=(None, None, 0, 0), out_axes=(0, 0),
+        )(model, state, points, calf_ids)
+        # jacobian_dot -> (num_feet, spatial_vector, num_dof)
+        jacobian_dot = jnp.concatenate([jacp_dot, jacr_dot], axis=-2)
+        # taskspace_bias -> (num_feet, spatial_acceleration)
+        taskspace_bias = jacobian_dot @ state.qd
+        jacp, jacr = jax.vmap(
+            mj_jacobian, in_axes=(None, None, 0, 0), out_axes=(0, 0),
+        )(model, state, points, calf_ids)
+        # taskspace_jacobian -> (num_feet, spatial_vector, num_dof)
+        taskspace_jacobian = jnp.concatenate([jacp, jacr], axis=-2)
 
-        # Coriolis and Gravity:
-        C = data.qfrc_bias
-
-        # Contact Jacobian:
-        J = data.efc_J[data.contact.efc_address]
-
-        # Testing this:
-        point = data.site_xpos[feet_ids] - data.xpos[calf_ids]
-        # jacp, jacr = mj_jacobian_dot(model, data, point[0], calf_ids[0])
-
-        # Mujoco jacDot Test:
-        jp = np.zeros((3, mj_model.nv))
-        jr = np.zeros((3, mj_model.nv))
-
-        # Make Data:
-        mj_data = mujoco.MjData(mj_model)
-        mj_data.qpos = np.squeeze(data.qpos)
-        mj_data.qvel = np.squeeze(data.qvel)
-        mj_data.ctrl = np.squeeze(data.ctrl)
-
-        # Step:
-        mujoco.mj_step(mj_model, mj_data)
-        point = mj_data.site_xpos[feet_site_ids] - mj_data.xpos[calf_body_ids]
-
-        mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point[0]), calf_body_ids[0])
-
-        new_data = mjx.put_data(mj_model, mj_data)
-        jacp, jacr = mj_jacobian_dot(model, new_data, point[0], calf_ids[0])
-
-        # Task Space Jacobians:
-        point = data.site_xpos[feet_ids] - data.xpos[calf_ids]
-        jacp, jacr = jax.vmap(mj_jacobian, in_axes=(None, None, 0, 0))(
-            model, data, point, calf_ids,
+        # Pack Struct:
+        osc_data = OSCData(
+            mass_matrix=mass_matrix,
+            coriolis_matrix=coriolis_matrix,
+            contact_jacobian=contact_jacobian,
+            taskspace_jacobian=taskspace_jacobian,
+            taskspace_bias=taskspace_bias,
         )
-        Jv = jnp.reshape(
-            jnp.concatenate([jacp, jacr], axis=-1),
-            shape=(calf_ids.shape[0], 6, -1),
-        )
-        dJv = mj_finite_difference_jacobian(model, data, calf_ids, feet_ids)
-        Jv_bias = dJv @ data.qvel
 
-        # Mujoco jacDot Test:
-        jp = np.zeros((3, mj_model.nv))
-        jr = np.zeros((3, mj_model.nv))
+        return (state), osc_data
 
-        # Make Data:
-        mj_data = mujoco.MjData(mj_model)
-        mj_data.qpos = np.squeeze(data.qpos)
-        mj_data.qvel = np.squeeze(data.qvel)
-        mj_data.ctrl = np.squeeze(data.ctrl)
+    # Run Loop:
+    initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
+    start_time = time.time()
+    final_state, osc_data = jax.lax.scan(
+        f=loop,
+        init=initial_state,
+        xs=None,
+        length=1000,
+    )
 
-        # Step:
-        mujoco.mj_step(mj_model, mj_data)
-        point = mj_data.site_xpos[feet_site_ids] - mj_data.xpos[calf_body_ids]
-
-        mujoco.mj_jacDot(mj_model, mj_data, jp, jr, np.squeeze(point[0]), calf_body_ids[0])
-
-        dJv_mujoco = np.concatenate([jp, jr])
-        pass
+    print(f"Time: {time.time() - start_time}")
 
 
 if __name__ == '__main__':
