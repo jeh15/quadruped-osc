@@ -29,14 +29,14 @@ class WeightConfig:
     hr_translational_tracking: float = 1.0
     hr_rotational_tracking: float = 1.0
     # Torque Minization Weight:
-    torque: float = 1e-3
+    torque: float = 1e-4
     # Regularization Weight:
     regularization: float = 1e-4
 
 
 @struct.dataclass
 class OSQPConfig:
-    check_primal_dual_infeasability: str | bool = False
+    check_primal_dual_infeasability: str | bool = True
     sigma: float = 1e-6
     momentum: float = 1.6
     eq_qp_solve: str = 'cg'
@@ -49,10 +49,10 @@ class OSQPConfig:
     maxiter: int = 4000
     tol: float = 1e-3
     termination_check_frequency: int = 5
-    verbose: Union[bool, int] = False
+    verbose: Union[bool, int] = True
     implicit_diff: bool = True
     implicit_diff_solve: Optional[Callable] = None
-    jit: bool = True
+    jit: bool = False
     unroll: str | bool = "auto"
 
 
@@ -69,9 +69,7 @@ class OSCController:
     def __init__(
         self,
         model: System | Model,
-        dv_size: int,
-        u_size: int,
-        z_size: int,
+        num_contacts: int,
         num_taskspace_targets: int,
         weights_config: WeightConfig = WeightConfig(),
         osqp_config: OSQPConfig = OSQPConfig(),
@@ -81,62 +79,66 @@ class OSCController:
         friction_coefficient: float = 0.8,
     ):
         """ Operational Space Control (OSC) Controller for Quadruped."""
-
+        assert bool(use_motor_model and control_matrix) is False, (
+            "If using the motor model, the control matrix must be None."
+        )
         # Weight Configuration:
-        self.weights_config = serialization.to_state_dict(weights_config)
+        self.weights_config: dict = serialization.to_state_dict(weights_config)
 
         # Design Variables:
-        self.dv_size = dv_size
-        self.u_size = u_size
-        self.z_size = z_size
+        self.dv_size: int = model.nv
+        self.u_size: int = model.nu
+        self.z_size: int = num_contacts * 6
 
         # Design Vector:
-        self.q = jnp.zeros((dv_size + u_size + z_size,))
+        self.q: jax.Array = jnp.zeros(
+            (self.dv_size + self.u_size + self.z_size,),
+        )
 
         # Joint Acceleration Indices:
-        self.dv_idx = self.dv_size
+        self.dv_idx: int = self.dv_size
 
         # Control Input Indices:
-        self.u_idx = self.dv_idx + self.u_size
+        self.u_idx: int = self.dv_idx + self.u_size
 
         # Contact Force Indices:
-        self.z_idx = self.u_idx + self.z_size
-
-        # Slack Variable Indices:
-        # self.slack_idx = self.z_idx + self.slack_size
+        self.z_idx: int = self.u_idx + self.z_size
 
         # Model Variables:
-        self.r = foot_radius
-        self.mu = friction_coefficient
-        self.torque_limits = model.actuator_forcerange
+        self.r: float = foot_radius
+        self.mu: float = friction_coefficient
+        self.ctrl_limits: jax.Array = model.actuator_ctrlrange
+        self.torque_limits: jax.Array = model.actuator_forcerange
 
-        if use_motor_model:
+        self.use_motor_model: bool = use_motor_model
+        self.B: jax.Array = jnp.concatenate(
+            [jnp.zeros((6, self.u_size)), jnp.eye(self.u_size)],
+            axis=0,
+        )
+        if self.use_motor_model:
             # Actuation Model:
             actuator_mask = model.actuator_trntype == mujoco.mjtTrn.mjTRN_JOINT
             trnid = model.actuator_trnid[actuator_mask, 0]
-            self.actuator_q_id = model.jnt_qposadr[trnid]
-            self.actuator_qd_id = model.jnt_dofadr[trnid]
-            self.actuator_gear = model.actuator_gear
-            self.actuator_gainprm = model.actuator_gainprm
-            self.actuator_biasprm = model.actuator_biasprm
-            self.B = jnp.eye(self.u_size)
+            self.actuator_q_id: jax.Array = model.jnt_qposadr[trnid]
+            self.actuator_qd_id: jax.Array = model.jnt_dofadr[trnid]
+            self.actuator_gear: jax.Array = model.actuator_gear
+            self.actuator_gainprm: jax.Array = model.actuator_gainprm
+            self.actuator_biasprm: jax.Array = model.actuator_biasprm
         else:
-            # Control Matrix:
-            if control_matrix is None:
-                self.B = jnp.concatenate(
-                    [jnp.zeros((6, self.u_size)), jnp.eye(self.u_size)],
-                    axis=0,
-                )
-            else:
-                self.B = control_matrix
+            if control_matrix is not None:
+                self.B: jax.Array = control_matrix
+
+        assert self.B.shape == (model.nv, self.u_size), (
+            "Control matrix shape should be size (NV, NU)."
+        )
 
         # Utility Variables:
-        self.num_contacts = self.z_size // 6
-        self.num_targets = num_taskspace_targets
+        self.num_contacts: int = num_contacts
+        self.num_targets: int = num_taskspace_targets
 
         # Initialize OSQP:
-        self.osqp_config = osqp_config
-        self.prog = BoxOSQP(
+        self.osqp_config: OSQPConfig = osqp_config
+        self.prog: BoxOSQP = BoxOSQP(
             check_primal_dual_infeasability=self.osqp_config.check_primal_dual_infeasability,
             sigma=self.osqp_config.sigma,
             momentum=self.osqp_config.momentum,
@@ -157,6 +159,9 @@ class OSCController:
             unroll=self.osqp_config.unroll,
         )
 
+        # Initialize Optimization Problem:
+        self._initialize_optimization()
+
     def equality_constraints(self, q: jax.Array, data: OSCData) -> jax.Array:
         """Compute equality constraints for the dynamics of a system.
 
@@ -176,7 +181,7 @@ class OSCController:
         """
         # Unpack Design Variables:
         dv, u, z = jnp.split(
-            q, [self.dv_idx, self.u_idx, self.z_idx],
+            q, [self.dv_idx, self.u_idx],
         )
         # Unpack Data:
         M = data.mass_matrix
@@ -184,7 +189,14 @@ class OSCController:
         J_contact = data.contact_jacobian
 
         # Dynamics Constraint:
-        dynamics = M @ dv + C - self.B @ u - J_contact.T @ z
+        if self.use_motor_model:
+            u = self.motor_model(
+                u,
+                data.previous_q[self.actuator_q_id],
+                data.previous_qd[self.actuator_qd_id],
+            )
+
+        dynamics = M @ dv + C - self.B @ u - J_contact @ z
 
         # Concatenate Constraints:
         equality_constraints = jnp.concatenate([dynamics])
@@ -212,7 +224,7 @@ class OSCController:
         """
         # Unpack Design Variables:
         dv, u, z = jnp.split(
-            q, [self.dv_idx, self.u_idx, self.z_idx],
+            q, [self.dv_idx, self.u_idx],
         )
 
         # Friction Constraints:
@@ -263,7 +275,7 @@ class OSCController:
         """
         # Unpack Design Variables:
         dv, u, z = jnp.split(
-            q, [self.dv_idx, self.u_idx, self.z_idx],
+            q, [self.dv_idx, self.u_idx],
         )
 
         # Task Space Objective:
@@ -333,7 +345,7 @@ class OSCController:
         """Regularization Objective Function."""
         return jnp.sum(jnp.square(q))
 
-    def initialize_optimization(self) -> None:
+    def _initialize_optimization(self) -> None:
         """Initialize the Optimization Problem."""
         # Generate Optimization Functions: (jacrev -> row by row, jacfwd -> column by column)
         self.Aeq_fn = jax.jacfwd(self.equality_constraints)
@@ -348,8 +360,12 @@ class OSCController:
         dv_lb = -jnp.inf * jnp.ones((self.dv_size,))
         dv_ub = jnp.inf * jnp.ones((self.dv_size,))
         # Control Input Bounds: u = [tau_fl, tau_fr, tau_hl, tau_hr]
-        u_lb = jnp.array(self.torque_limits[:, 0])
-        u_ub = jnp.array(self.torque_limits[:, 1])
+        if self.use_motor_model:
+            u_lb = jnp.array(self.ctrl_limits[:, 0])
+            u_ub = jnp.array(self.ctrl_limits[:, 1])
+        else:
+            u_lb = jnp.array(self.torque_limits[:, 0])
+            u_ub = jnp.array(self.torque_limits[:, 1])
         # Reaction Forces: z = [f_x, f_y, f_z, tau_x, tau_y, tau_z]
         z_lb = jnp.array(
             [-jnp.inf, -jnp.inf, 0.0, -jnp.inf, -jnp.inf, -jnp.inf] * 4,
@@ -397,7 +413,7 @@ class OSCController:
         self, u: jax.Array, q: jax.Array, qd: jax.Array,
     ) -> jax.Array:
         """Brax Motor Model."""
-        bias = self.actuator_gear * (
+        bias = self.actuator_gear[:, 0] * (
             self.actuator_biasprm[:, 1] * q + self.actuator_biasprm[:, 2] * qd
         )
-        return self.actuator_gear * (self.actuator_gainprm[:, 0] * u + bias)
+        return self.actuator_gear[:, 0] * (self.actuator_gainprm[:, 0] * u + bias)

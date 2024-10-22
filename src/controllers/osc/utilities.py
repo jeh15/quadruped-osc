@@ -6,6 +6,8 @@ from brax.base import System
 from brax.mjx.base import State
 from mujoco.mjx._src.types import Model, Data
 
+import mujoco
+
 import src.math_utilities as math_utils
 
 
@@ -16,9 +18,20 @@ class OSCData:
     contact_jacobian: jax.Array
     taskspace_jacobian: jax.Array
     taskspace_bias: jax.Array
-    # Maybe if we want to use actuation model:
-    # previous_q: jax.Array
-    # previous_qd: jax.Array
+    previous_q: jax.Array
+    previous_qd: jax.Array
+
+
+def _create_basis(friction: jax.Array) -> jax.Array:
+    basis = jnp.stack([
+        jnp.ones((10,)),
+        jnp.pad(jnp.array([friction[0], -friction[0]]), (0, 8)),
+        jnp.pad(jnp.array([friction[1], -friction[1]]), (2, 6)),
+        jnp.pad(jnp.array([friction[2], -friction[2]]), (4, 4)),
+        jnp.pad(jnp.array([friction[3], -friction[3]]), (6, 2)),
+        jnp.pad(jnp.array([friction[4], -friction[4]]), (8, 0)),
+    ])
+    return basis
 
 
 def get_data(
@@ -34,8 +47,21 @@ def get_data(
     # Coriolis Matrix:
     coriolis_matrix = data.qfrc_bias
 
-    # Contact Jacobian:
-    contact_jacobian = data.efc_J[data.contact.efc_address]
+    # Mujoco Contact Jacobian:
+    # if model.opt.cone == mujoco.mjtCone.mjCONE_PYRAMIDAL:
+    #     pyramid_jacobians = jnp.array(
+    #         jnp.split(data.efc_J, data.contact.efc_address)[1:],
+    #     )
+    #     basis = jax.vmap(_create_basis)(data.contact.friction)
+    #     contact_jacobians = basis @ pyramid_jacobians
+    #     contact_jacobian = jnp.concatenate(contact_jacobians)
+    # elif model.opt.cone == mujoco.mjtCone.mjCONE_ELLIPTIC:
+    #     contact_jacobians = jnp.array(
+    #         jnp.split(data.efc_J, data.contact.efc_address)[1:],
+    #     )
+    #     contact_jacobian = jnp.concatenate(contact_jacobians)
+    # else:
+    #     raise ValueError("Invalid Cone Type.")
 
     # Taskspace Jacobian:
     jacp_dot, jacr_dot = jax.vmap(
@@ -54,6 +80,12 @@ def get_data(
     # Taskspace Jacobian -> Shape: (num_body_ids, 6, NV)
     taskspace_jacobian = jnp.concatenate([jacp, jacr], axis=-2)
 
+    # Contact Jacobian -> Shape: (num_contacts, NV, 6) -> (NV, 6 * num_contacts)
+    contact_jacobian = jnp.concatenate(
+        jax.vmap(jnp.transpose)(taskspace_jacobian[1:]),
+        axis=-1,
+    )
+
     # Pack Struct:
     return OSCData(
         mass_matrix=mass_matrix,
@@ -61,5 +93,6 @@ def get_data(
         contact_jacobian=contact_jacobian,
         taskspace_jacobian=taskspace_jacobian,
         taskspace_bias=taskspace_bias,
+        previous_q=data.qpos,
+        previous_qd=data.qvel,
     )
-
