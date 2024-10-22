@@ -397,4 +397,4 @@ class OSCController:
         bias = self.actuator_gear * (
             self.actuator_biasprm[:, 1] * q + self.actuator_biasprm[:, 2] * qd
         )
-        return self.actuator_gainprm[:, 0] * u + bias
+        return self.actuator_gear * (self.actuator_gainprm[:, 0] * u + bias)
