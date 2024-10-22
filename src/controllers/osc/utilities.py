@@ -16,6 +16,9 @@ class OSCData:
     contact_jacobian: jax.Array
     taskspace_jacobian: jax.Array
     taskspace_bias: jax.Array
+    # Maybe if we want to use actuation model:
+    # previous_q: jax.Array
+    # previous_qd: jax.Array
 
 
 def get_data(
@@ -38,10 +41,10 @@ def get_data(
     jacp_dot, jacr_dot = jax.vmap(
         math_utils.mj_jacobian_dot, in_axes=(None, None, 0, 0), out_axes=(0, 0),
     )(model, data, points, body_ids)
-    
+
     # Jacobian Dot -> Shape: (num_body_ids, 6, NV)
     jacobian_dot = jnp.concatenate([jacp_dot, jacr_dot], axis=-2)
-    
+
     # Taskspace Bias Acceleration -> Shape: (num_body_ids, 6)
     taskspace_bias = jacobian_dot @ data.qvel
     jacp, jacr = jax.vmap(
@@ -59,3 +62,4 @@ def get_data(
         taskspace_jacobian=taskspace_jacobian,
         taskspace_bias=taskspace_bias,
     )
+
