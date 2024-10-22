@@ -123,7 +123,10 @@ class OSCController:
         else:
             # Control Matrix:
             if control_matrix is None:
-                self.B = jnp.eye(self.u_size)
+                self.B = jnp.concatenate(
+                    [jnp.zeros((6, self.u_size)), jnp.eye(self.u_size)],
+                    axis=0,
+                )
             else:
                 self.B = control_matrix
 
