@@ -22,18 +22,6 @@ class OSCData:
     previous_qd: jax.Array
 
 
-def _create_basis(friction: jax.Array) -> jax.Array:
-    basis = jnp.stack([
-        jnp.ones((10,)),
-        jnp.pad(jnp.array([friction[0], -friction[0]]), (0, 8)),
-        jnp.pad(jnp.array([friction[1], -friction[1]]), (2, 6)),
-        jnp.pad(jnp.array([friction[2], -friction[2]]), (4, 4)),
-        jnp.pad(jnp.array([friction[3], -friction[3]]), (6, 2)),
-        jnp.pad(jnp.array([friction[4], -friction[4]]), (8, 0)),
-    ])
-    return basis
-
-
 def get_data(
     model: Model | System,
     data: Data | State,
@@ -46,22 +34,6 @@ def get_data(
 
     # Coriolis Matrix:
     coriolis_matrix = data.qfrc_bias
-
-    # Mujoco Contact Jacobian:
-    # if model.opt.cone == mujoco.mjtCone.mjCONE_PYRAMIDAL:
-    #     pyramid_jacobians = jnp.array(
-    #         jnp.split(data.efc_J, data.contact.efc_address)[1:],
-    #     )
-    #     basis = jax.vmap(_create_basis)(data.contact.friction)
-    #     contact_jacobians = basis @ pyramid_jacobians
-    #     contact_jacobian = jnp.concatenate(contact_jacobians)
-    # elif model.opt.cone == mujoco.mjtCone.mjCONE_ELLIPTIC:
-    #     contact_jacobians = jnp.array(
-    #         jnp.split(data.efc_J, data.contact.efc_address)[1:],
-    #     )
-    #     contact_jacobian = jnp.concatenate(contact_jacobians)
-    # else:
-    #     raise ValueError("Invalid Cone Type.")
 
     # Taskspace Jacobian:
     jacp_dot, jacr_dot = jax.vmap(

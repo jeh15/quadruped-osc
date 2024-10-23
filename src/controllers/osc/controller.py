@@ -18,8 +18,8 @@ from src.controllers.osc.utilities import OSCData
 @struct.dataclass
 class WeightConfig:
     # Task Space Tracking Weights:
-    base_translational_tracking: float = 1.0
-    base_rotational_tracking: float = 1.0
+    base_translational_tracking: float = 100.0
+    base_rotational_tracking: float = 100.0
     fl_translational_tracking: float = 1.0
     fl_rotational_tracking: float = 1.0
     fr_translational_tracking: float = 1.0
@@ -49,10 +49,10 @@ class OSQPConfig:
     maxiter: int = 4000
     tol: float = 1e-3
     termination_check_frequency: int = 5
-    verbose: Union[bool, int] = True
+    verbose: Union[bool, int] = 1
     implicit_diff: bool = True
     implicit_diff_solve: Optional[Callable] = None
-    jit: bool = False
+    jit: bool = True
     unroll: str | bool = "auto"
 
 
@@ -107,7 +107,15 @@ class OSCController:
         # Model Variables:
         self.r: float = foot_radius
         self.mu: float = friction_coefficient
-        self.ctrl_limits: jax.Array = model.actuator_ctrlrange
+        self.ctrl_limits: jax.Array = jnp.concatenate([
+            jnp.expand_dims(
+                jnp.array([-0.9472, -1.4, -2.6227] * 4), axis=1,
+            ),
+            jnp.expand_dims(
+                jnp.array([0.9472, 2.5, -0.84776] * 4), axis=1,
+            )],
+            axis=1,
+        )
         self.torque_limits: jax.Array = model.actuator_forcerange
 
         self.use_motor_model: bool = use_motor_model
@@ -115,6 +123,7 @@ class OSCController:
             [jnp.zeros((6, self.u_size)), jnp.eye(self.u_size)],
             axis=0,
         )
+        self.default_ctrl: jax.Array = jnp.zeros((self.u_size,))
         if self.use_motor_model:
             # Actuation Model:
             actuator_mask = model.actuator_trntype == mujoco.mjtTrn.mjTRN_JOINT
@@ -124,6 +133,7 @@ class OSCController:
             self.actuator_gear: jax.Array = model.actuator_gear
             self.actuator_gainprm: jax.Array = model.actuator_gainprm
             self.actuator_biasprm: jax.Array = model.actuator_biasprm
+            self.default_ctrl: jax.Array = jnp.array(model.keyframe('home').ctrl)
         else:
             if control_matrix is not None:
                 self.B: jax.Array = control_matrix

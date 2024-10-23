@@ -12,17 +12,19 @@ import mujoco
 from mujoco import mjx
 from brax.mjx import pipeline
 
+from brax.io import mjcf, html
+
 from src.controllers.osc import utilities as osc_utils
 from src.controllers.osc import controller
+from src.controllers.osc.controller import OSQPConfig
 
 jax.config.update('jax_enable_x64', True)
-# jax.config.update('jax_disable_jit', True)
 
 
 def main(argv):
     xml_path = os.path.join(
         os.path.dirname(__file__),
-        'models/unitree_go2/scene_mjx.xml',
+        'models/unitree_go2/scene_mjx_torque.xml',
     )
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
@@ -68,7 +70,9 @@ def main(argv):
     data = mjx.make_data(model)
 
     # Initialize MJX Data:
-    data = data.replace(qpos=q_init, qvel=qd_init, ctrl=default_ctrl)
+    data = data.replace(
+        qpos=q_init, qvel=qd_init, ctrl=jnp.zeros_like(default_ctrl),
+    )
     data = mjx.forward(model, data)
 
     # JIT Functions:
@@ -78,19 +82,51 @@ def main(argv):
     # Initialize OSC Controller:
     taskspace_targets = jnp.zeros((5, 6))
     osc_controller = controller.OSCController(
-        model=model,
+        model=mj_model,
         num_contacts=4,
         num_taskspace_targets=5,
-        use_motor_model=True,
+        use_motor_model=False,
+        osqp_config=OSQPConfig(
+            tol=1e-6,
+            maxiter=50000,
+            verbose=False,
+            jit=True,
+        ),
     )
 
     # JIT Controller Functions:
-    get_data_fn = osc_utils.get_data
-    update_fn = osc_controller.update
-    solve_fn = osc_controller.solve
+    get_data_fn = jax.jit(osc_utils.get_data)
+    update_fn = jax.jit(osc_controller.update)
+    solve_fn = jax.jit(osc_controller.solve)
 
     state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
-    for _ in range(1000):
+
+    # Initialize Warmstart:
+    body_points = jnp.zeros((1, 3))
+    feet_points = (data.site_xpos[feet_ids] - data.xpos[calf_ids])
+    points = jnp.concatenate([body_points, feet_points])
+    body_ids = jnp.concatenate([base_id, calf_ids])
+
+    osc_data = get_data_fn(model, state, points, body_ids)
+
+    prog_data = update_fn(taskspace_targets, osc_data)
+
+    weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
+    init_x = jnp.concatenate([
+        jnp.zeros(osc_controller.dv_size),
+        default_ctrl,
+        jnp.array([0, 0, weight / 4, 0, 0, 0] * 4),
+    ])
+
+    warmstart = osc_controller.prog.init_params(
+        init_x=init_x,
+        params_obj=(prog_data.H, prog_data.f),
+        params_eq=prog_data.A,
+        params_ineq=(prog_data.lb, prog_data.ub),
+    )
+
+    state_history = []
+    for i in range(400):
         body_points = jnp.zeros((1, 3))
         feet_points = (data.site_xpos[feet_ids] - data.xpos[calf_ids])
         points = jnp.concatenate([body_points, feet_points])
@@ -98,11 +134,28 @@ def main(argv):
 
         osc_data = get_data_fn(model, state, points, body_ids)
 
+        taskspace_targets = np.zeros((5, 6))
+        kp = 250
+        kd = 50
+        base_target = kp * (state.qpos[:3] - q_init[:3]) + kd * (-state.qvel[:3])
+        taskspace_targets[0, :3] = base_target
+
         prog_data = update_fn(taskspace_targets, osc_data)
 
-        solution = solve_fn(prog_data)
+        solution = solve_fn(prog_data, warmstart)
 
-        state = step_fn(model, state, default_ctrl)
+        dv, u, z = jnp.split(
+            solution.params.primal[0],
+            [osc_controller.dv_idx, osc_controller.u_idx],
+        )
+        print(f'Iteration: {i}')
+        print(f'Status: {solution.state.status}')
+        print(f'Error: {solution.state.error}')
+
+        warmstart = solution.params
+
+        state = step_fn(model, state, u)
+        state_history.append(state)
 
     # def loop(carry: jax.Array, xs: None) -> Tuple[jax.Array, None]:
     #     state = carry
@@ -132,7 +185,21 @@ def main(argv):
     #     length=1000,
     # )
 
-    print(f"Time: {time.time() - start_time}")
+    sys = mjcf.load_model(mj_model)
+    html_string = html.render(
+        sys=sys,
+        states=state_history,
+        height="100vh",
+        colab=False,
+    )
+
+    html_path = os.path.join(
+        os.path.dirname(__file__),
+        "visualization/visualization.html",
+    )
+
+    with open(html_path, "w") as f:
+        f.writelines(html_string)
 
 
 if __name__ == '__main__':
