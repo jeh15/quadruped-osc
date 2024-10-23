@@ -6,8 +6,6 @@ from brax.base import System
 from brax.mjx.base import State
 from mujoco.mjx._src.types import Model, Data
 
-import mujoco
-
 import src.math_utilities as math_utils
 
 
@@ -52,9 +50,10 @@ def get_data(
     # Taskspace Jacobian -> Shape: (num_body_ids, 6, NV)
     taskspace_jacobian = jnp.concatenate([jacp, jacr], axis=-2)
 
-    # Contact Jacobian -> Shape: (num_contacts, NV, 6) -> (NV, 6 * num_contacts)
+    # Contact Jacobian -> Shape: (num_contacts, NV, 3) -> (NV, 3 * num_contacts)
+    # TODO(jeh15) Translational only:
     contact_jacobian = jnp.concatenate(
-        jax.vmap(jnp.transpose)(taskspace_jacobian[1:]),
+        jax.vmap(jnp.transpose)(taskspace_jacobian[1:])[:, :, :3],
         axis=-1,
     )
 

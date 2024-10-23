@@ -15,8 +15,7 @@ from brax.mjx import pipeline
 from brax.io import mjcf, html
 
 from src.controllers.osc import utilities as osc_utils
-from src.controllers.osc import controller
-from src.controllers.osc.controller import OSQPConfig
+from src.controllers.osc.tests._fixed_base_controller import OSCController, OSQPConfig
 
 jax.config.update('jax_enable_x64', True)
 
@@ -24,7 +23,7 @@ jax.config.update('jax_enable_x64', True)
 def main(argv):
     xml_path = os.path.join(
         os.path.dirname(__file__),
-        'models/unitree_go2/scene_mjx_torque.xml',
+        'models/unitree_go2/scene_mjx_fixed.xml',
     )
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
@@ -43,15 +42,6 @@ def main(argv):
         for f in feet_site
     ]
     feet_ids = jnp.asarray(feet_site_ids)
-
-    base_body = [
-        'base_link',
-    ]
-    base_body_id = [
-        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY.value, b)
-        for b in base_body
-    ]
-    base_id = jnp.asarray(base_body_id)
 
     calf_body = [
             'front_left_calf',
@@ -75,16 +65,17 @@ def main(argv):
     )
     data = mjx.forward(model, data)
 
+    initial_feet_pos = data.site_xpos[feet_ids]
+
     # JIT Functions:
     init_fn = jax.jit(pipeline.init)
     step_fn = jax.jit(pipeline.step)
 
     # Initialize OSC Controller:
-    taskspace_targets = jnp.zeros((5, 6))
-    osc_controller = controller.OSCController(
+    taskspace_targets = jnp.zeros((4, 6))
+    osc_controller = OSCController(
         model=mj_model,
-        num_contacts=4,
-        num_taskspace_targets=5,
+        num_taskspace_targets=4,
         use_motor_model=False,
         osqp_config=OSQPConfig(
             tol=1e-3,
@@ -102,20 +93,16 @@ def main(argv):
     state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
 
     # Initialize Warmstart:
-    body_points = jnp.zeros((1, 3))
-    feet_points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
-    points = jnp.concatenate([body_points, feet_points])
-    body_ids = jnp.concatenate([base_id, calf_ids])
+    points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
+    body_ids = calf_ids
 
     osc_data = get_data_fn(model, state, points, body_ids)
 
     prog_data = update_fn(taskspace_targets, osc_data)
 
-    weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
     init_x = jnp.concatenate([
         jnp.zeros(osc_controller.dv_size),
-        default_ctrl,
-        jnp.array([0, 0, weight / 4] * 4),
+        jnp.zeros_like(default_ctrl),
     ])
 
     warmstart = osc_controller.prog.init_params(
@@ -126,31 +113,29 @@ def main(argv):
     )
 
     state_history = []
-    for i in range(150):
-        body_points = jnp.zeros((1, 3))
-        feet_points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
-        points = jnp.concatenate([body_points, feet_points])
-        body_ids = jnp.concatenate([base_id, calf_ids])
+    for i in range(1000):
+        points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
 
         osc_data = get_data_fn(model, state, points, body_ids)
 
-        taskspace_targets = np.zeros((5, 6))
+        taskspace_targets = np.zeros((4, 6))
         kp = 100
         kd = 50
-        base_target = kp * (state.qpos[:3] - q_init[:3]) + kd * (-state.qvel[:3])
-        taskspace_targets[0, :3] = base_target
+        targets = kp * (initial_feet_pos - state.site_xpos[feet_ids])
+        taskspace_targets[:, :3] = targets
 
         prog_data = update_fn(taskspace_targets, osc_data)
 
         solution = solve_fn(prog_data, warmstart)
 
-        dv, u, z = jnp.split(
+        dv, u = jnp.split(
             solution.params.primal[0],
-            [osc_controller.dv_idx, osc_controller.u_idx],
+            [osc_controller.dv_idx],
         )
         print(f'Iteration: {i}')
         print(f'Status: {solution.state.status}')
         print(f'Error: {solution.state.error}')
+        print(f'Torques: {u}')
 
         warmstart = solution.params
 

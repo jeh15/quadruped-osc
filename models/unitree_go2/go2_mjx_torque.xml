@@ -186,18 +186,18 @@
   </worldbody>
 
   <actuator>
-    <motor class="go2/abduction" name="front_right_hip" joint="front_right_hip_joint"/>
-    <motor class="go2/hip" name="front_right_thigh" joint="front_right_thigh_joint"/>
-    <motor class="go2/knee" name="front_right_calf" joint="front_right_calf_joint"/>
     <motor class="go2/abduction" name="front_left_hip" joint="front_left_hip_joint"/>
     <motor class="go2/hip" name="front_left_thigh" joint="front_left_thigh_joint"/>
     <motor class="go2/knee" name="front_left_calf" joint="front_left_calf_joint"/>
-    <motor class="go2/abduction" name="hind_right_hip" joint="hind_right_hip_joint"/>
-    <motor class="go2/hip" name="hind_right_thigh" joint="hind_right_thigh_joint"/>
-    <motor class="go2/knee" name="hind_right_calf" joint="hind_right_calf_joint"/>
+    <motor class="go2/abduction" name="front_right_hip" joint="front_right_hip_joint"/>
+    <motor class="go2/hip" name="front_right_thigh" joint="front_right_thigh_joint"/>
+    <motor class="go2/knee" name="front_right_calf" joint="front_right_calf_joint"/>
     <motor class="go2/abduction" name="hind_left_hip" joint="hind_left_hip_joint"/>
     <motor class="go2/hip" name="hind_left_thigh" joint="hind_left_thigh_joint"/>
     <motor class="go2/knee" name="hind_left_calf" joint="hind_left_calf_joint"/>
+    <motor class="go2/abduction" name="hind_right_hip" joint="hind_right_hip_joint"/>
+    <motor class="go2/hip" name="hind_right_thigh" joint="hind_right_thigh_joint"/>
+    <motor class="go2/knee" name="hind_right_calf" joint="hind_right_calf_joint"/>
   </actuator>
 
   <sensor>
