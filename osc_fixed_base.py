@@ -17,7 +17,16 @@ from brax.io import mjcf, html
 from src.controllers.osc import utilities as osc_utils
 from src.controllers.osc.tests._fixed_base_controller import OSCController, OSQPConfig
 
+# Types:
+from jaxopt.base import KKTSolution
+from brax.mjx.base import State
+import brax
+
+import matplotlib.pyplot as plt
+
+
 jax.config.update('jax_enable_x64', True)
+# jax.config.update('jax_disable_jit', True)
 
 
 def main(argv):
@@ -78,8 +87,9 @@ def main(argv):
         num_taskspace_targets=4,
         use_motor_model=False,
         osqp_config=OSQPConfig(
+            check_primal_dual_infeasability=False,
             tol=1e-3,
-            maxiter=50000,
+            maxiter=4000,
             verbose=False,
             jit=True,
         ),
@@ -112,68 +122,200 @@ def main(argv):
         params_ineq=(prog_data.lb, prog_data.ub),
     )
 
-    state_history = []
-    for i in range(1000):
+    # start_time = time.time()
+    # state_history = []
+    # feet_targets = []
+    # for i in range(1000):
+    #     # Feet site position relative to calf body:
+    #     points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
+
+    #     # Feet site velocity:
+    #     offset = brax.base.Transform.create(pos=points)
+    #     foot_indices = calf_ids - 1
+    #     foot_velocities = offset.vmap().do(state.xd.take(foot_indices)).vel
+
+    #     # Get OSC Data:
+    #     osc_data = get_data_fn(model, state, points, body_ids)
+
+    #     # Calculate Taskspace Targets:
+    #     kp = 500
+    #     kd = 10
+    #     magnitude, frequency = 0.01, model.opt.timestep
+    #     feet_position_targets = jax.vmap(lambda x: jnp.array([
+    #         magnitude * jnp.sin(frequency * i) + x[0],
+    #         x[1],
+    #         magnitude * jnp.cos(frequency * i) + (x[2] - magnitude),
+    #     ]))(initial_feet_pos)
+    #     feet_velocity_targets = jnp.array([
+    #         magnitude * frequency * jnp.cos(frequency * i),
+    #         0.0,
+    #         -magnitude * frequency * jnp.sin(frequency * i),
+    #     ] * 4).reshape(4, 3)
+    #     feet_acceleration_targets = jnp.array([
+    #         -magnitude * frequency**2 * jnp.sin(frequency * i),
+    #         0.0,
+    #         -magnitude * frequency**2 * jnp.cos(frequency * i),
+    #     ] * 4).reshape(4, 3)
+    #     targets = feet_acceleration_targets + kp * (
+    #         feet_position_targets - state.site_xpos[feet_ids]
+    #         ) + kd * (feet_velocity_targets - foot_velocities)
+    #     taskspace_targets = jnp.concatenate(
+    #         [targets, jnp.zeros((4, 3))], axis=-1,
+    #     )
+
+    #     # Update Program Data:
+    #     prog_data = update_fn(taskspace_targets, osc_data)
+
+    #     # Solve OSC Problem:
+    #     solution = solve_fn(prog_data, warmstart)
+    #     dv, u = jnp.split(
+    #         solution.params.primal[0],
+    #         [osc_controller.dv_idx],
+    #     )
+    #     warmstart = solution.params
+
+    #     print(f'Iteration: {i}')
+    #     print(f'Status: {solution.state.status}')
+
+    #     # Step Forward:
+    #     state = step_fn(model, state, u)
+    #     state_history.append(state)
+    #     feet_targets.append(feet_position_targets)
+
+    # print(f"Python Loop Execution Time: {time.time() - start_time}")
+
+    def loop(
+        carry: Tuple[State, KKTSolution], xs: jax.Array,
+    ) -> Tuple[Tuple[State, KKTSolution], Tuple[State, jax.Array]]:
+        # Unpack Carry:
+        state, warmstart = carry
+
+        # Feet site position relative to calf body:
         points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
 
+        # Feet site velocity:
+        offset = brax.base.Transform.create(pos=points)
+        foot_indices = calf_ids - 1
+        foot_velocities = offset.vmap().do(state.xd.take(foot_indices)).vel
+
+        # Get OSC Data:
         osc_data = get_data_fn(model, state, points, body_ids)
 
-        taskspace_targets = np.zeros((4, 6))
+        # Calculate Taskspace Targets:
         kp = 100
-        kd = 50
-        targets = kp * (initial_feet_pos - state.site_xpos[feet_ids])
-        taskspace_targets[:, :3] = targets
+        kd = 10
+        magnitude, frequency = 0.05, model.opt.timestep / 2.0
+        feet_position_targets = jax.vmap(lambda x: jnp.array([
+            magnitude * jnp.sin(frequency * xs) + x[0],
+            x[1],
+            -magnitude * jnp.cos(frequency * xs) + (x[2] + magnitude),
+        ]))(initial_feet_pos)
+        feet_velocity_targets = jnp.array([
+            magnitude * frequency * jnp.cos(frequency * xs),
+            0.0,
+            magnitude * frequency * jnp.sin(frequency * xs),
+        ] * 4).reshape(4, 3)
+        feet_acceleration_targets = jnp.array([
+            -magnitude * frequency**2 * jnp.sin(frequency * xs),
+            0.0,
+            magnitude * frequency**2 * jnp.cos(frequency * xs),
+        ] * 4).reshape(4, 3)
+        targets = feet_acceleration_targets + kp * (
+            feet_position_targets - state.site_xpos[feet_ids]
+            ) + kd * (feet_velocity_targets - foot_velocities)
+        taskspace_targets = jnp.concatenate(
+            [targets, jnp.zeros((4, 3))], axis=-1,
+        )
 
+        # Update Program Data:
         prog_data = update_fn(taskspace_targets, osc_data)
 
+        # Solve OSC Problem:
         solution = solve_fn(prog_data, warmstart)
-
         dv, u = jnp.split(
             solution.params.primal[0],
             [osc_controller.dv_idx],
         )
-        print(f'Iteration: {i}')
-        print(f'Status: {solution.state.status}')
-        print(f'Error: {solution.state.error}')
-        print(f'Torques: {u}')
-
         warmstart = solution.params
 
+        # Step Forward:
         state = step_fn(model, state, u)
-        state_history.append(state)
 
-    # def loop(carry: jax.Array, xs: None) -> Tuple[jax.Array, None]:
-    #     state = carry
+        return (state, warmstart), (state, feet_position_targets)
 
-    #     body_points = jnp.zeros((1, 3))
-    #     feet_points = (data.site_xpos[feet_ids] - data.xpos[calf_ids])
-    #     points = jnp.concatenate([body_points, feet_points])
-    #     body_ids = jnp.concatenate([base_id, calf_ids])
+    # Run Loop:
+    initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
+    initial_warmstart = osc_controller.prog.init_params(
+        init_x=init_x,
+        params_obj=(prog_data.H, prog_data.f),
+        params_eq=prog_data.A,
+        params_ineq=(prog_data.lb, prog_data.ub),
+    )
+    iterations = jnp.arange(5000)
+    start_time = time.time()
+    (final_state, warmstart), (states, feet_targets) = jax.lax.scan(
+        f=loop,
+        init=(initial_state, initial_warmstart),
+        xs=iterations,
+    )
+    print(f"JAX Loop Execution Time: {time.time() - start_time}")
 
-    #     osc_data = get_data_fn(model, state, points, body_ids)
+    # Plot Feet Position vs Targets:
+    fig, ax = plt.subplots(1, 1)
+    ax.plot(states.site_xpos[:, feet_ids[0], 0], states.site_xpos[:, feet_ids[0], 2], label="Foot Trajectory", linewidth=2.0)
+    ax.plot(feet_targets[:, 0, 0], feet_targets[:, 0, 2], label="Target", linestyle="--",  linewidth=2.0)
+    ax.set_xlabel("X Position", fontsize=14)
+    ax.set_ylabel("Z Position", fontsize=14)
+    ax.axis("equal")
+    ax.legend()
+    plt.show()
 
-    #     prog_data = update_fn(taskspace_targets, osc_data)
+    # # Plot Feet Position vs Targets:
+    # feet_positions = []
+    # foot_target = []
+    # for i in range(len(state_history)):
+    #     feet_positions.append(
+    #         [state_history[i].site_xpos[feet_ids[0], 0], state_history[i].site_xpos[feet_ids[0], 2]]
+    #     )
+    #     foot_target.append([feet_targets[i][0, 0], feet_targets[i][0, 2]])
 
-    #     solution = solve_fn(prog_data)
+    # feet_positions = np.array(feet_positions)
+    # foot_target = np.array(foot_target)
 
-    #     state = step_fn(model, state, default_ctrl)
+    # fig, ax = plt.subplots(1, 1)
+    # ax.plot(feet_positions[:, 0], feet_positions[:, 1], label="Actual")
+    # ax.plot(foot_target[:, 0], foot_target[:, 1], label="Target", linestyle="--")
+    # ax.set_xlabel("X Position")
+    # ax.set_ylabel("Z Position")
+    # ax.axis("equal")
+    # ax.legend()
+    # plt.show()
 
-    #     return (state), None
+    fig.savefig("feet_position_vs_targets.png")
 
-    # # Run Loop:
-    # initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
-    # start_time = time.time()
-    # final_state, osc_data = jax.lax.scan(
-    #     f=loop,
-    #     init=initial_state,
-    #     xs=None,
-    #     length=1000,
-    # )
+    state_list = []
+    num_steps = states.q.shape[0]
+    for i in range(num_steps):
+        state_list.append(
+            State(
+                q=states.q[i],
+                qd=states.qd[i],
+                x=brax.base.Transform(
+                    pos=states.x.pos[i],
+                    rot=states.x.rot[i],
+                ),
+                xd=brax.base.Motion(
+                    vel=states.xd.vel[i],
+                    ang=states.xd.ang[i],
+                ),
+                **data.__dict__,
+            ),
+        )
 
     sys = mjcf.load_model(mj_model)
     html_string = html.render(
         sys=sys,
-        states=state_history,
+        states=state_list,
         height="100vh",
         colab=False,
     )
