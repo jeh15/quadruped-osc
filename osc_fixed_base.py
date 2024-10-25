@@ -122,7 +122,7 @@ def main(argv):
         params_ineq=(prog_data.lb, prog_data.ub),
     )
 
-    # start_time = time.time()
+    start_time = time.time()
     # state_history = []
     # feet_targets = []
     # for i in range(1000):
@@ -202,6 +202,9 @@ def main(argv):
         osc_data = get_data_fn(model, state, points, body_ids)
 
         # Calculate Taskspace Targets:
+        taskspace_targets = jnp.zeros((4, 6))
+
+        # Calculate Taskspace Targets:
         kp = 100
         kd = 10
         magnitude, frequency = 0.05, model.opt.timestep / 2.0
@@ -221,11 +224,11 @@ def main(argv):
             magnitude * frequency**2 * jnp.cos(frequency * xs),
         ] * 4).reshape(4, 3)
         targets = feet_acceleration_targets + kp * (
-            feet_position_targets - state.site_xpos[feet_ids]
-            ) + kd * (feet_velocity_targets - foot_velocities)
-        taskspace_targets = jnp.concatenate(
-            [targets, jnp.zeros((4, 3))], axis=-1,
-        )
+            state.site_xpos[feet_ids] - feet_position_targets
+            ) + kd * (foot_velocities -feet_velocity_targets)
+        # taskspace_targets = jnp.concatenate(
+        #     [targets, jnp.zeros((4, 3))], axis=-1,
+        # )
 
         # Update Program Data:
         prog_data = update_fn(taskspace_targets, osc_data)

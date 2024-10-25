@@ -18,7 +18,7 @@ from src.controllers.osc.utilities import OSCData
 @struct.dataclass
 class WeightConfig:
     # Task Space Tracking Weights:
-    fl_translational_tracking: float = 1000.0
+    fl_translational_tracking: float = 10.0
     fl_rotational_tracking: float = 1.0
     fr_translational_tracking: float = 1.0
     fr_rotational_tracking: float = 1.0
@@ -227,13 +227,18 @@ class OSCController:
         # Task Space Objective:
         J_task = data.taskspace_jacobian
         task_bias = data.taskspace_bias
-        ddx_task = J_task @ dv + task_bias
+        ddx_taskspace = J_task @ dv + task_bias
 
-        ddx_fl, ddx_fr, ddx_hl, ddx_hr = jnp.split(
-            ddx_task, self.num_targets,
+        ddx_task = jnp.split(
+            ddx_taskspace, self.num_targets, axis=0,
         )
-        ddx_fl_t, ddx_fr_t, ddx_hl_t, ddx_hr_t = jnp.split(
-            desired_task_ddx, self.num_targets,
+        ddx_fl, ddx_fr, ddx_hl, ddx_hr = jax.tree.map(jnp.squeeze, ddx_task)
+
+        ddx_target = jnp.split(
+            desired_task_ddx, self.num_targets, axis=0,
+        )
+        ddx_fl_t, ddx_fr_t, ddx_hl_t, ddx_hr_t = jax.tree.map(
+            jnp.squeeze, ddx_target,
         )
 
         # Objective Function:
