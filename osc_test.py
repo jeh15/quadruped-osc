@@ -2,8 +2,6 @@ from typing import Tuple
 from absl import app
 import os
 
-import time
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +15,12 @@ from brax.io import mjcf, html
 from src.controllers.osc import utilities as osc_utils
 from src.controllers.osc import controller
 from src.controllers.osc.controller import OSQPConfig
+
+# Types:
+from jaxopt.base import KKTSolution
+from brax.mjx.base import State
+import brax
+
 
 jax.config.update('jax_enable_x64', True)
 
@@ -43,6 +47,10 @@ def main(argv):
         for f in feet_site
     ]
     feet_ids = jnp.asarray(feet_site_ids)
+
+    imu_id = jnp.asarray(
+        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE.value, 'imu'),
+    )
 
     base_body = [
         'base_link',
@@ -88,7 +96,7 @@ def main(argv):
         use_motor_model=False,
         osqp_config=OSQPConfig(
             tol=1e-3,
-            maxiter=50000,
+            maxiter=4000,
             verbose=False,
             jit=True,
         ),
@@ -101,9 +109,13 @@ def main(argv):
 
     state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
 
-    # Initialize Warmstart:
-    body_points = jnp.zeros((1, 3))
-    feet_points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
+    # Initialize Values and Warmstart:
+    num_steps = 5000
+    kick_magnitude = 0.25
+    kick_interval = 100
+    base_position_target = state.site_xpos[imu_id]
+    body_points = jnp.expand_dims(state.site_xpos[imu_id], axis=0)
+    feet_points = state.site_xpos[feet_ids]
     points = jnp.concatenate([body_points, feet_points])
     body_ids = jnp.concatenate([base_id, calf_ids])
 
@@ -125,70 +137,94 @@ def main(argv):
         params_ineq=(prog_data.lb, prog_data.ub),
     )
 
-    state_history = []
-    for i in range(150):
-        body_points = jnp.zeros((1, 3))
-        feet_points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
+    def loop(
+        carry: Tuple[State, KKTSolution, jax.Array], xs: jax.Array,
+    ) -> Tuple[Tuple[State, KKTSolution, jax.Array], State]:
+        state, warmstart, key = carry
+        key, subkey = jax.random.split(key)
+
+        # Random Disturbance:
+        kick_theta = jax.random.uniform(subkey, maxval=2 * jnp.pi)
+        kick = jnp.array([jnp.cos(kick_theta), jnp.sin(kick_theta)])
+        kick *= jnp.mod(xs, kick_interval) == 0
+        qvel = state.qvel
+        qvel = qvel.at[:2].set(kick_magnitude * kick + qvel[:2])
+        state = state.replace(qvel=qvel)
+
+        # Get Body and Feet Points:
+        body_points = jnp.expand_dims(data.site_xpos[imu_id], axis=0)
+        feet_points = data.site_xpos[feet_ids]
         points = jnp.concatenate([body_points, feet_points])
         body_ids = jnp.concatenate([base_id, calf_ids])
 
+        # Calculate Task Space Targets: PD Controller
+        kp = 100
+        kd = 25
+        imu_data = jnp.reshape(state.sensordata[-6:], (2, 3))
+        base_target = kp * (base_position_target - imu_data[0]) + kd * (-imu_data[1])
+        base_targets = jnp.concatenate(
+            [jnp.expand_dims(base_target, axis=0), jnp.zeros((1, 3))], axis=-1,
+        )
+        feet_targets = jnp.zeros((4, 6))
+        taskspace_targets = jnp.concatenate(
+            [base_targets, feet_targets], axis=0,
+        )
+
+        # Zero Acceleration Targets:
+        # taskspace_targets = jnp.zeros((5, 6))
+
+        # Get OSC Data
         osc_data = get_data_fn(model, state, points, body_ids)
 
-        taskspace_targets = np.zeros((5, 6))
-        kp = 100
-        kd = 50
-        base_target = kp * (state.qpos[:3] - q_init[:3]) + kd * (-state.qvel[:3])
-        taskspace_targets[0, :3] = base_target
-
+        # Update QP:
         prog_data = update_fn(taskspace_targets, osc_data)
 
+        # Solve QP:
         solution = solve_fn(prog_data, warmstart)
-
         dv, u, z = jnp.split(
             solution.params.primal[0],
             [osc_controller.dv_idx, osc_controller.u_idx],
         )
-        print(f'Iteration: {i}')
-        print(f'Status: {solution.state.status}')
-        print(f'Error: {solution.state.error}')
-
         warmstart = solution.params
 
+        # Step Simulation:
         state = step_fn(model, state, u)
-        state_history.append(state)
 
-    # def loop(carry: jax.Array, xs: None) -> Tuple[jax.Array, None]:
-    #     state = carry
+        return (state, warmstart, subkey), state
 
-    #     body_points = jnp.zeros((1, 3))
-    #     feet_points = (data.site_xpos[feet_ids] - data.xpos[calf_ids])
-    #     points = jnp.concatenate([body_points, feet_points])
-    #     body_ids = jnp.concatenate([base_id, calf_ids])
+    # Run Loop:
+    initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
+    key = jax.random.key(0)
+    (final_state, _, _), states = jax.lax.scan(
+        f=loop,
+        init=(initial_state, warmstart, key),
+        xs=jnp.arange(num_steps),
+    )
 
-    #     osc_data = get_data_fn(model, state, points, body_ids)
-
-    #     prog_data = update_fn(taskspace_targets, osc_data)
-
-    #     solution = solve_fn(prog_data)
-
-    #     state = step_fn(model, state, default_ctrl)
-
-    #     return (state), None
-
-    # # Run Loop:
-    # initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
-    # start_time = time.time()
-    # final_state, osc_data = jax.lax.scan(
-    #     f=loop,
-    #     init=initial_state,
-    #     xs=None,
-    #     length=1000,
-    # )
+    # Visualize:
+    state_list = []
+    num_steps = states.q.shape[0]
+    for i in range(num_steps):
+        state_list.append(
+            State(
+                q=states.q[i],
+                qd=states.qd[i],
+                x=brax.base.Transform(
+                    pos=states.x.pos[i],
+                    rot=states.x.rot[i],
+                ),
+                xd=brax.base.Motion(
+                    vel=states.xd.vel[i],
+                    ang=states.xd.ang[i],
+                ),
+                **data.__dict__,
+            ),
+        )
 
     sys = mjcf.load_model(mj_model)
     html_string = html.render(
         sys=sys,
-        states=state_history,
+        states=state_list,
         height="100vh",
         colab=False,
     )
