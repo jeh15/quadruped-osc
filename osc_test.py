@@ -23,6 +23,7 @@ import brax
 
 
 jax.config.update('jax_enable_x64', True)
+# jax.config.update('jax_disable_jit', True)
 
 
 def main(argv):
@@ -33,7 +34,7 @@ def main(argv):
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
     q_init = jnp.asarray(mj_model.keyframe('home').qpos)
-    qd_init = np.asarray(mj_model.keyframe('home').qvel)
+    qd_init = jnp.asarray(mj_model.keyframe('home').qvel)
     default_ctrl = jnp.asarray(mj_model.keyframe('home').ctrl)
 
     feet_site = [
@@ -111,9 +112,10 @@ def main(argv):
 
     # Initialize Values and Warmstart:
     num_steps = 5000
-    kick_magnitude = 0.25
+    kick_magnitude = 0.2
     kick_interval = 100
     base_position_target = state.site_xpos[imu_id]
+    imu_offset = jnp.array([-0.02557, 0.0, 0.04232])
     body_points = jnp.expand_dims(state.site_xpos[imu_id], axis=0)
     feet_points = state.site_xpos[feet_ids]
     points = jnp.concatenate([body_points, feet_points])
@@ -157,7 +159,7 @@ def main(argv):
         points = jnp.concatenate([body_points, feet_points])
         body_ids = jnp.concatenate([base_id, calf_ids])
 
-        # Calculate Task Space Targets: PD Controller
+        # Initial Position Target:
         kp = 100
         kd = 25
         imu_data = jnp.reshape(state.sensordata[-6:], (2, 3))
@@ -169,6 +171,23 @@ def main(argv):
         taskspace_targets = jnp.concatenate(
             [base_targets, feet_targets], axis=0,
         )
+
+        # Foot Center Target:
+        # kp = 100
+        # kd = 25
+        # imu_data = jnp.reshape(state.sensordata[-6:], (2, 3))
+        # polygon_center = imu_offset - jnp.mean(feet_points, axis=0)
+        # position_target = jnp.array([
+        #     polygon_center[0], polygon_center[1], base_position_target[2],
+        # ])
+        # base_target = kp * (position_target - imu_data[0]) + kd * (-imu_data[1])
+        # base_targets = jnp.concatenate(
+        #     [jnp.expand_dims(base_target, axis=0), jnp.zeros((1, 3))], axis=-1,
+        # )
+        # feet_targets = jnp.zeros((4, 6))
+        # taskspace_targets = jnp.concatenate(
+        #     [base_targets, feet_targets], axis=0,
+        # )
 
         # Zero Acceleration Targets:
         # taskspace_targets = jnp.zeros((5, 6))
