@@ -245,6 +245,11 @@
     
     <framepos name="frame_pos" objtype="site" objname="imu"/>
     <framelinvel name="frame_vel" objtype="site" objname="imu"/>
+
+    <!-- <framelinvel objtype="site" objname="front_left_foot" name="fl_linvel"/>
+    <framelinvel objtype="site" objname="front_right_foot" name="fr_linvel"/>
+    <framelinvel objtype="site" objname="hind_left_foot" name="hl_linvel"/>
+    <framelinvel objtype="site" objname="hind_right_foot" name="hr_linvel"/> -->
   </sensor>
 
 </mujoco>

@@ -20,11 +20,11 @@ class WeightConfig:
     # Task Space Tracking Weights:
     fl_translational_tracking: float = 10.0
     fl_rotational_tracking: float = 1.0
-    fr_translational_tracking: float = 1.0
+    fr_translational_tracking: float = 10.0
     fr_rotational_tracking: float = 1.0
-    hl_translational_tracking: float = 1.0
+    hl_translational_tracking: float = 10.0
     hl_rotational_tracking: float = 1.0
-    hr_translational_tracking: float = 1.0
+    hr_translational_tracking: float = 10.0
     hr_rotational_tracking: float = 1.0
     # Torque Minization Weight:
     torque: float = 1e-4

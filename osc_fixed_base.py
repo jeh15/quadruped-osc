@@ -103,7 +103,7 @@ def main(argv):
     state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
 
     # Initialize Warmstart:
-    points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
+    points = state.site_xpos[feet_ids]
     body_ids = calf_ids
 
     osc_data = get_data_fn(model, state, points, body_ids)
@@ -191,23 +191,21 @@ def main(argv):
         state, warmstart = carry
 
         # Feet site position relative to calf body:
-        points = (state.site_xpos[feet_ids] - state.xpos[calf_ids])
+        points = state.site_xpos[feet_ids]
 
-        # Feet site velocity:
-        offset = brax.base.Transform.create(pos=points)
+        # Feet site velocity: (This is correct compared to mujoco framelinvel sensor)
+        relative_position = state.site_xpos[feet_ids] - state.xpos[calf_ids]
+        offset = brax.base.Transform.create(pos=relative_position)
         foot_indices = calf_ids - 1
         foot_velocities = offset.vmap().do(state.xd.take(foot_indices)).vel
 
         # Get OSC Data:
         osc_data = get_data_fn(model, state, points, body_ids)
 
-        # Calculate Taskspace Targets:
-        taskspace_targets = jnp.zeros((4, 6))
-
-        # Calculate Taskspace Targets:
-        kp = 100
+        # Calculate Taskspace Targets: Circle
+        kp = 1000
         kd = 10
-        magnitude, frequency = 0.05, model.opt.timestep / 2.0
+        magnitude, frequency = 0.05, model.opt.timestep
         feet_position_targets = jax.vmap(lambda x: jnp.array([
             magnitude * jnp.sin(frequency * xs) + x[0],
             x[1],
@@ -224,8 +222,22 @@ def main(argv):
             magnitude * frequency**2 * jnp.cos(frequency * xs),
         ] * 4).reshape(4, 3)
         targets = feet_acceleration_targets + kp * (
-            state.site_xpos[feet_ids] - feet_position_targets
-            ) + kd * (foot_velocities -feet_velocity_targets)
+            feet_position_targets - state.site_xpos[feet_ids]
+            ) + kd * (feet_velocity_targets - foot_velocities)
+        taskspace_targets = jnp.concatenate(
+            [targets, jnp.zeros((4, 3))], axis=-1,
+        )
+
+        # Sinewave Z Direction:
+        # kp = 1000
+        # kd = 10
+        # magnitude, frequency = 0.1, model.opt.timestep
+        # feet_position_targets = jax.vmap(lambda x: jnp.array([
+        #     x[0],
+        #     x[1],
+        #     magnitude * jnp.sin(frequency * xs) + x[2],
+        # ]))(initial_feet_pos)
+        # targets = kp * (feet_position_targets - state.site_xpos[feet_ids]) + kd * (jnp.zeros_like(foot_velocities) - foot_velocities)
         # taskspace_targets = jnp.concatenate(
         #     [targets, jnp.zeros((4, 3))], axis=-1,
         # )
@@ -254,7 +266,7 @@ def main(argv):
         params_eq=prog_data.A,
         params_ineq=(prog_data.lb, prog_data.ub),
     )
-    iterations = jnp.arange(5000)
+    iterations = jnp.arange(10000)
     start_time = time.time()
     (final_state, warmstart), (states, feet_targets) = jax.lax.scan(
         f=loop,
@@ -264,13 +276,17 @@ def main(argv):
     print(f"JAX Loop Execution Time: {time.time() - start_time}")
 
     # Plot Feet Position vs Targets:
-    fig, ax = plt.subplots(1, 1)
-    ax.plot(states.site_xpos[:, feet_ids[0], 0], states.site_xpos[:, feet_ids[0], 2], label="Foot Trajectory", linewidth=2.0)
-    ax.plot(feet_targets[:, 0, 0], feet_targets[:, 0, 2], label="Target", linestyle="--",  linewidth=2.0)
-    ax.set_xlabel("X Position", fontsize=14)
-    ax.set_ylabel("Z Position", fontsize=14)
-    ax.axis("equal")
-    ax.legend()
+    fig, ax = plt.subplots(3, 1)
+    ax[0].plot(states.site_xpos[:, feet_ids[0], 0], states.site_xpos[:, feet_ids[0], 2], label="Foot Trajectory", linewidth=2.0)
+    ax[0].plot(feet_targets[:, 0, 0], feet_targets[:, 0, 2], label="Target", linestyle="--",  linewidth=2.0)
+    ax[0].set_xlabel("X Position", fontsize=14)
+    ax[0].set_ylabel("Z Position", fontsize=14)
+    ax[0].axis("equal")
+    ax[0].legend()
+    ax[1].plot(iterations, states.site_xpos[:, feet_ids[0], 0], label="Foot Trajectory", linewidth=2.0)
+    ax[1].plot(iterations, feet_targets[:, 0, 0], label="Target", linestyle="--",  linewidth=2.0)
+    ax[2].plot(iterations, states.site_xpos[:, feet_ids[0], 2], label="Foot Trajectory", linewidth=2.0)
+    ax[2].plot(iterations, feet_targets[:, 0, 2], label="Target", linestyle="--",  linewidth=2.0)
     plt.show()
 
     # # Plot Feet Position vs Targets:
