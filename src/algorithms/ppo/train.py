@@ -140,7 +140,6 @@ def train(
     if restored_checkpoint is None:
         network = network_factory(
             observation_size=env_state.obs.shape[-1],
-            action_size=env.action_size,
             input_normalization_fn=normalization_fn,
         )
     else:
