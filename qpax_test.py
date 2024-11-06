@@ -11,22 +11,16 @@ from mujoco import mjx
 from brax.mjx import pipeline
 
 from src.controllers.osc import utilities as osc_utils
-from src.controllers.osc import controller
-from src.controllers.osc.controller import OSQPConfig
+from src.controllers.osc import controller_qpax as controller
+
+# New JAX QP Solver:
+import qpax
 
 # Types:
 from jaxopt.base import KKTSolution
 from brax.mjx.base import State
 
 import time
-
-# os.environ['XLA_FLAGS'] = (
-#     '--xla_gpu_enable_triton_softmax_fusion=true '
-#     '--xla_gpu_triton_gemm_any=True '
-#     '--xla_gpu_enable_async_collectives=true '
-#     '--xla_gpu_enable_latency_hiding_scheduler=true '
-#     '--xla_gpu_enable_highest_priority_async_stream=true '
-# )
 
 jax.config.update('jax_enable_x64', True)
 
@@ -104,7 +98,7 @@ def main(argv):
     step_fn = jax.jit(jax.vmap(env_step, in_axes=(None, 0, 0)))
 
     # Number of Parallel Envs:
-    batch_size = 1024
+    batch_size = 64
 
     # Initialize OSC Controller:
     taskspace_targets = jnp.zeros((batch_size, 5, 6))
@@ -112,21 +106,11 @@ def main(argv):
         model=mj_model,
         num_contacts=4,
         num_taskspace_targets=5,
-        use_motor_model=False,
-        osqp_config=OSQPConfig(
-            check_primal_dual_infeasability=False,
-            tol=1e-3,
-            maxiter=4000,
-            verbose=False,
-            jit=True,
-        ),
     )
 
     # JIT Controller Functions:
     get_data_fn = jax.jit(jax.vmap(osc_utils.get_data, in_axes=(None, 0, 0, None)))
     update_fn = jax.jit(jax.vmap(osc_controller.update, in_axes=(0, 0)))
-    warmstart_fn = jax.jit(osc_controller.initialize_warmstart)
-    solve_fn = jax.jit(osc_controller.solve)
 
     q_init = jnp.tile(q_init, (batch_size, 1))
     qd_init = jnp.tile(qd_init, (batch_size, 1))
@@ -134,43 +118,15 @@ def main(argv):
 
     # Initialize Values and Warmstart:
     num_steps = 10000
-    body_points = jnp.expand_dims(state.site_xpos[:, imu_id], axis=1)
-    feet_points = state.site_xpos[:, feet_ids]
-    points = jnp.concatenate([body_points, feet_points], axis=1)
     body_ids = jnp.concatenate([base_id, calf_ids])
 
-    osc_data = get_data_fn(model, state, points, body_ids)
-
-    prog_data = update_fn(taskspace_targets, osc_data)
-
-    weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
-    init_x = jnp.concatenate([
-        jnp.zeros(osc_controller.dv_size),
-        default_ctrl,
-        jnp.array([0, 0, weight / 4] * 4),
-    ])
-    init_x = jnp.tile(init_x, (batch_size, 1))
-
-    # init_x = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(init_x, batch_size))
-    # Q = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.H, batch_size))
-    # c = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.f, batch_size))
-    # A = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.A, batch_size))
-    # lb = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.lb, batch_size))
-    # ub = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.ub, batch_size))
-
-    # init_x = jnp.concatenate(init_x, axis=0)
-    # Q = jax.scipy.linalg.block_diag(*prog_data.H)
-    # c = jnp.concatenate(prog_data.f, axis=0)
-    # A = jax.scipy.linalg.block_diag(*prog_data.A)
-    # lb = jnp.concatenate(prog_data.lb, axis=0)
-    # ub = jnp.concatenate(prog_data.ub, axis=0)
-
-    warmstart = warmstart_fn(init_x, prog_data)
+    # QPAX Functions:
+    batch_solve = jax.vmap(qpax.solve_qp_primal, in_axes=(0, 0, 0, 0, 0, 0))
 
     def loop(
         carry: Tuple[State, KKTSolution, jax.Array], xs: jax.Array,
     ) -> Tuple[Tuple[State, KKTSolution, jax.Array], State]:
-        state, warmstart, key = carry
+        state, key = carry
         key, subkey = jax.random.split(key)
 
         # Get Body and Feet Points:
@@ -185,28 +141,21 @@ def main(argv):
         prog_data = update_fn(taskspace_targets, osc_data)
 
         # Solve QP:
-        solution = solve_fn(prog_data, warmstart)
-
-        primal = jnp.reshape(solution.params.primal[0], (batch_size, -1))
-        dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
-
-        # primal = jnp.stack(solution.params.primal[0], axis=0)
-        # dv, u, z = jax.vmap(lambda x: jnp.split(x, [osc_controller.dv_idx, osc_controller.u_idx]))(primal)
-
-        warmstart = solution.params
+        xs = batch_solve(prog_data.H, prog_data.f, prog_data.A, prog_data.b, prog_data.G, prog_data.h)
+        dv, u, z = jnp.split(xs, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
 
         # Step Simulation:
         state = step_fn(model, state, u)
 
-        return (state, warmstart, subkey), state
+        return (state, subkey), state
 
     # Run Loop:
     initial_state = init_fn(model, q_init, qd_init)
     key = jax.random.key(0)
     start_time = time.time()
-    (final_state, _, _), states = jax.lax.scan(
+    (final_state, _), states = jax.lax.scan(
         f=loop,
-        init=(initial_state, warmstart, key),
+        init=(initial_state, key),
         xs=jnp.arange(num_steps),
     )
     final_state.q.block_until_ready()

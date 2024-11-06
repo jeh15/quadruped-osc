@@ -17,19 +17,15 @@ from src.controllers.osc.controller import OSQPConfig
 # Types:
 from jaxopt.base import KKTSolution
 from brax.mjx.base import State
+from src.controllers.osc.controller import OptimizationData
 
 import time
 
-# os.environ['XLA_FLAGS'] = (
-#     '--xla_gpu_enable_triton_softmax_fusion=true '
-#     '--xla_gpu_triton_gemm_any=True '
-#     '--xla_gpu_enable_async_collectives=true '
-#     '--xla_gpu_enable_latency_hiding_scheduler=true '
-#     '--xla_gpu_enable_highest_priority_async_stream=true '
-# )
+# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 
 jax.config.update('jax_enable_x64', True)
-
+# jax.config.update('jax_compiler_enable_remat_pass', False)
+# jax.config.update('jax_disable_jit', True)
 
 def main(argv):
     xml_path = os.path.join(
@@ -104,10 +100,12 @@ def main(argv):
     step_fn = jax.jit(jax.vmap(env_step, in_axes=(None, 0, 0)))
 
     # Number of Parallel Envs:
-    batch_size = 1024
+    num_envs = 1024
+    batch_size = 256
+    num_minibatches = 4
 
     # Initialize OSC Controller:
-    taskspace_targets = jnp.zeros((batch_size, 5, 6))
+    taskspace_targets = jnp.zeros((num_envs, 5, 6))
     osc_controller = controller.OSCController(
         model=mj_model,
         num_contacts=4,
@@ -128,19 +126,18 @@ def main(argv):
     warmstart_fn = jax.jit(osc_controller.initialize_warmstart)
     solve_fn = jax.jit(osc_controller.solve)
 
-    q_init = jnp.tile(q_init, (batch_size, 1))
-    qd_init = jnp.tile(qd_init, (batch_size, 1))
+    # Initialize State:
+    q_init = jnp.tile(q_init, (num_envs, 1))
+    qd_init = jnp.tile(qd_init, (num_envs, 1))
     state = init_fn(model, q_init, qd_init)
 
     # Initialize Values and Warmstart:
-    num_steps = 10000
+    num_steps = 1000
     body_points = jnp.expand_dims(state.site_xpos[:, imu_id], axis=1)
     feet_points = state.site_xpos[:, feet_ids]
     points = jnp.concatenate([body_points, feet_points], axis=1)
     body_ids = jnp.concatenate([base_id, calf_ids])
-
     osc_data = get_data_fn(model, state, points, body_ids)
-
     prog_data = update_fn(taskspace_targets, osc_data)
 
     weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
@@ -149,65 +146,104 @@ def main(argv):
         default_ctrl,
         jnp.array([0, 0, weight / 4] * 4),
     ])
-    init_x = jnp.tile(init_x, (batch_size, 1))
+    init_x = jnp.tile(init_x, (num_envs, 1))
 
-    # init_x = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(init_x, batch_size))
-    # Q = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.H, batch_size))
-    # c = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.f, batch_size))
-    # A = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.A, batch_size))
-    # lb = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.lb, batch_size))
-    # ub = jax.tree.map(lambda x: jnp.squeeze(x), jnp.split(prog_data.ub, batch_size))
+    # Batched Warmstart:
+    def batch_warmstart(x: jax.Array, data: OptimizationData) -> KKTSolution:
+        def minibatch(carry: None, xs: Tuple[jax.Array, OptimizationData]) -> Tuple[None, KKTSolution]:
+            x, data = xs
+            warmstart = warmstart_fn(x, data)
+            return None, warmstart
+        
+        # Split into Batches:
+        x = jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
+        data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), data)
 
-    # init_x = jnp.concatenate(init_x, axis=0)
-    # Q = jax.scipy.linalg.block_diag(*prog_data.H)
-    # c = jnp.concatenate(prog_data.f, axis=0)
-    # A = jax.scipy.linalg.block_diag(*prog_data.A)
-    # lb = jnp.concatenate(prog_data.lb, axis=0)
-    # ub = jnp.concatenate(prog_data.ub, axis=0)
+        _, warmstart = jax.lax.scan(
+            f=minibatch,
+            init=None,
+            xs=(x, data),
+        )
 
-    warmstart = warmstart_fn(init_x, prog_data)
+        warmstart = jax.tree.map(lambda x: jnp.concatenate(x, axis=0), warmstart)
+        return warmstart
+    
+    warmstart = jax.jit(batch_warmstart)(init_x, prog_data)
+    
 
-    def loop(
-        carry: Tuple[State, KKTSolution, jax.Array], xs: jax.Array,
-    ) -> Tuple[Tuple[State, KKTSolution, jax.Array], State]:
-        state, warmstart, key = carry
-        key, subkey = jax.random.split(key)
+    num_control_steps = 10
+    def loop(carry, xs):
+        def batched_solve(carry, xs):
+            data, warmstart = xs
+            solution = solve_fn(data, warmstart)
 
-        # Get Body and Feet Points:
-        body_points = jnp.expand_dims(state.site_xpos[:, imu_id], axis=1)
-        feet_points = state.site_xpos[:, feet_ids]
-        points = jnp.concatenate([body_points, feet_points], axis=1)
+            primal = jnp.reshape(solution.params.primal[0], (batch_size, -1))
+            dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
+            warmstart = solution.params
 
-        # Get OSC Data
-        osc_data = get_data_fn(model, state, points, body_ids)
+            return None, (u, warmstart)
 
-        # Update QP:
-        prog_data = update_fn(taskspace_targets, osc_data)
+        def step_unroll(carry, xs):
+            state, ctrl = carry
+            next_state = step_fn(model, state, ctrl)
+            return (next_state, ctrl), None
 
-        # Solve QP:
-        solution = solve_fn(prog_data, warmstart)
+        def batched_step(carry, xs):
+            state, warmstart = carry
 
-        primal = jnp.reshape(solution.params.primal[0], (batch_size, -1))
-        dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
+            # Calculate Control:
+            body_points = jnp.expand_dims(state.site_xpos[:, imu_id], axis=1)
+            feet_points = state.site_xpos[:, feet_ids]
+            points = jnp.concatenate([body_points, feet_points], axis=1)
+            osc_data = get_data_fn(model, state, points, body_ids)
+            prog_data = update_fn(taskspace_targets, osc_data)
 
-        # primal = jnp.stack(solution.params.primal[0], axis=0)
-        # dv, u, z = jax.vmap(lambda x: jnp.split(x, [osc_controller.dv_idx, osc_controller.u_idx]))(primal)
+            # Split into Batches:
+            batched_data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), prog_data)
+            batched_warmstart = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), warmstart)
+            
+            # Solve:
+            _, (u, next_warmstart) = jax.lax.scan(
+                f=batched_solve,
+                init=None,
+                xs=(batched_data, batched_warmstart),
+            )
 
-        warmstart = solution.params
+            # Format Control and Warmstart:
+            u = jnp.concatenate(u, axis=0)
+            next_warmstart = jax.tree.map(lambda x: jnp.concatenate(x, axis=0), next_warmstart)
 
-        # Step Simulation:
-        state = step_fn(model, state, u)
+            (next_state, _), _ = jax.lax.scan(
+                f=step_unroll,
+                init=(state, u),
+                xs=None,
+                length=num_control_steps,
+            )
 
-        return (state, warmstart, subkey), state
+            return (next_state, next_warmstart), (next_state, next_warmstart)
+        
+        # Unpack Carry:
+        state, warmstart = carry
+
+        # Run Batched Step:
+        (next_state, next_warmstart), _ = jax.lax.scan(
+            f=batched_step,
+            init=(state, warmstart),
+            xs=None,
+            length=batch_size * num_minibatches // num_envs,
+        )
+
+        return (next_state, next_warmstart), _
 
     # Run Loop:
     initial_state = init_fn(model, q_init, qd_init)
     key = jax.random.key(0)
     start_time = time.time()
-    (final_state, _, _), states = jax.lax.scan(
+    (final_state, _), _ = jax.lax.scan(
         f=loop,
-        init=(initial_state, warmstart, key),
-        xs=jnp.arange(num_steps),
+        init=(initial_state, warmstart),
+        xs=None,
+        length=num_steps,
     )
     final_state.q.block_until_ready()
     print(f"Time Elapsed: {time.time() - start_time}")

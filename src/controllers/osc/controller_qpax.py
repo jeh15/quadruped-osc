@@ -62,9 +62,9 @@ class OptimizationData:
     H: jax.Array
     f: jax.Array
     A: jax.Array
-    lb: jax.Array
-    ub: jax.Array
-
+    b: jax.Array
+    G: jax.Array
+    h: jax.Array
 
 class OSCController:
     def __init__(
@@ -73,16 +73,11 @@ class OSCController:
         num_contacts: int,
         num_taskspace_targets: int,
         weights_config: WeightConfig = WeightConfig(),
-        osqp_config: OSQPConfig = OSQPConfig(),
         control_matrix: Optional[jax.Array] = None,
-        use_motor_model: bool = False,
         foot_radius: float = 0.02,
         friction_coefficient: float = 0.8,
     ):
         """ Operational Space Control (OSC) Controller for Quadruped."""
-        assert bool(use_motor_model and control_matrix) is False, (
-            "If using the motor model, the control matrix must be None."
-        )
         # Weight Configuration:
         self.weights_config: dict = serialization.to_state_dict(weights_config)
 
@@ -119,56 +114,25 @@ class OSCController:
         )
         self.torque_limits: jax.Array = model.actuator_forcerange
 
-        self.use_motor_model: bool = use_motor_model
         self.B: jax.Array = jnp.concatenate(
             [jnp.zeros((6, self.u_size)), jnp.eye(self.u_size)],
             axis=0,
         )
-        self.default_ctrl: jax.Array = jnp.zeros((self.u_size,))
-        if self.use_motor_model:
-            # Actuation Model:
-            actuator_mask = model.actuator_trntype == mujoco.mjtTrn.mjTRN_JOINT
-            trnid = model.actuator_trnid[actuator_mask, 0]
-            self.actuator_q_id: jax.Array = model.jnt_qposadr[trnid]
-            self.actuator_qd_id: jax.Array = model.jnt_dofadr[trnid]
-            self.actuator_gear: jax.Array = model.actuator_gear
-            self.actuator_gainprm: jax.Array = model.actuator_gainprm
-            self.actuator_biasprm: jax.Array = model.actuator_biasprm
-            self.default_ctrl: jax.Array = jnp.array(model.keyframe('home').ctrl)
-        else:
-            if control_matrix is not None:
-                self.B: jax.Array = control_matrix
-
+        if control_matrix is not None:
+            self.B: jax.Array = control_matrix
+        
         assert self.B.shape == (model.nv, self.u_size), (
             "Control matrix shape should be size (NV, NU)."
         )
+
+        self.default_ctrl: jax.Array = jnp.zeros((self.u_size,))
+
 
         # Utility Variables:
         self.num_contacts: int = num_contacts
         self.num_targets: int = num_taskspace_targets
 
-        # Initialize OSQP:
-        self.osqp_config: OSQPConfig = osqp_config
-        self.prog: BoxOSQP = BoxOSQP(
-            check_primal_dual_infeasability=self.osqp_config.check_primal_dual_infeasability,
-            sigma=self.osqp_config.sigma,
-            momentum=self.osqp_config.momentum,
-            eq_qp_solve=self.osqp_config.eq_qp_solve,
-            rho_start=self.osqp_config.rho_start,
-            rho_min=self.osqp_config.rho_min,
-            rho_max=self.osqp_config.rho_max,
-            stepsize_updates_frequency=self.osqp_config.stepsize_updates_frequency,
-            primal_infeasible_tol=self.osqp_config.primal_infeasible_tol,
-            dual_infeasible_tol=self.osqp_config.dual_infeasible_tol,
-            maxiter=self.osqp_config.maxiter,
-            tol=self.osqp_config.tol,
-            termination_check_frequency=self.osqp_config.termination_check_frequency,
-            verbose=self.osqp_config.verbose,
-            implicit_diff=self.osqp_config.implicit_diff,
-            implicit_diff_solve=self.osqp_config.implicit_diff_solve,
-            jit=self.osqp_config.jit,
-            unroll=self.osqp_config.unroll,
-        )
+        # Initialize QP:
 
         # Initialize Design Variables:
         weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
@@ -209,13 +173,6 @@ class OSCController:
         J_contact = data.contact_jacobian
 
         # Dynamics Constraint:
-        if self.use_motor_model:
-            u = self.motor_model(
-                u,
-                data.previous_q[self.actuator_q_id],
-                data.previous_qd[self.actuator_qd_id],
-            )
-
         dynamics = M @ dv + C - self.B @ u - J_contact @ z
 
         # Concatenate Constraints:
@@ -361,17 +318,13 @@ class OSCController:
 
         # Constant Matricies:
         optimization_size = self.dv_size + self.u_size + self.z_size
-        self.Abox = jnp.eye(N=optimization_size, M=optimization_size)
+        Abox = jnp.eye(N=optimization_size, M=optimization_size)
         # Joint Acceleration Bounds: dv = [qdd]
         dv_lb = -jnp.inf * jnp.ones((self.dv_size,))
         dv_ub = jnp.inf * jnp.ones((self.dv_size,))
         # Control Input Bounds: u = [tau_fl, tau_fr, tau_hl, tau_hr]
-        if self.use_motor_model:
-            u_lb = jnp.array(self.ctrl_limits[:, 0])
-            u_ub = jnp.array(self.ctrl_limits[:, 1])
-        else:
-            u_lb = jnp.array(self.torque_limits[:, 0])
-            u_ub = jnp.array(self.torque_limits[:, 1])
+        u_lb = jnp.array(self.torque_limits[:, 0])
+        u_ub = jnp.array(self.torque_limits[:, 1])
         # Reaction Forces: z = [f_x, f_y, f_z, tau_x, tau_y, tau_z]
         z_lb = jnp.array(
             [-jnp.inf, -jnp.inf, 0.0] * 4,
@@ -382,139 +335,25 @@ class OSCController:
         self.box_lb = jnp.concatenate([dv_lb, u_lb, z_lb])
         self.box_ub = jnp.concatenate([dv_ub, u_ub, z_ub])
 
+        # Box Constraints:
+        self.Abox = jnp.concatenate([Abox, -Abox], axis=0)
+        self.hbox = jnp.concatenate([self.box_ub, -self.box_lb])
+
         # Inequality Constraints are constant:
-        self.Aineq = self.Aineq_fn(self.q)
-        self.bineq_ub = -self.inequality_constraints(self.q)
-        self.bineq_lb = -jnp.inf * jnp.ones_like(self.bineq_ub)
+        self.G = self.Aineq_fn(self.q)
+        self.h = -self.inequality_constraints(self.q)
 
     def update(
         self, taskspace_targets: jax.Array, data: OSCData
     ) -> OptimizationData:
         """Update the Mathematical Program Matricies."""
-        Aeq = self.Aeq_fn(self.q, data)
-        beq = -self.equality_constraints(self.q, data)
+        A = self.Aeq_fn(self.q, data)
+        b = -self.equality_constraints(self.q, data)
 
         H = self.H_fn(self.q, taskspace_targets, data)
         f = self.f_fn(self.q, taskspace_targets, data)
 
-        A = jnp.concatenate([Aeq, self.Aineq, self.Abox])
-        lb = jnp.concatenate([beq, self.bineq_lb, self.box_lb])
-        ub = jnp.concatenate([beq, self.bineq_ub, self.box_ub])
+        G = self.G
+        h = self.h
 
-        return OptimizationData(H=H, f=f, A=A, lb=lb, ub=ub)
-
-    # def initialize_warmstart(
-    #     self,
-    #     data: OptimizationData,
-    #     batch_size: int = 1,
-    # ) -> KKTSolution:
-    #     """Solve using OSQP Solver."""
-    #     # Unpack OptimizationData to List:
-    #     H = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.H, batch_size),
-    #     )
-    #     f = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.f, batch_size),
-    #     )
-    #     A = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.A, batch_size),
-    #     )
-    #     lb = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.lb, batch_size),
-    #     )
-    #     ub = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.ub, batch_size),
-    #     )
-    #     init_x = jnp.tile(self.init_x, (batch_size, 1))
-
-    #     warmstart = self.prog.init_params(
-    #         init_x=init_x,
-    #         params_obj=(H, f),
-    #         params_eq=A,
-    #         params_ineq=(lb, ub),
-    #     )
-    #     return warmstart
-
-    # def solve(
-    #     self,
-    #     data: OptimizationData,
-    #     warmstart: Optional[Any] = None,
-    #     batch_size: int = 1,
-    # ) -> OptStep:
-    #     """Solve using OSQP Solver."""
-    #     # Unpack OptimizationData to List:
-    #     H = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.H, batch_size),
-    #     )
-    #     f = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.f, batch_size),
-    #     )
-    #     A = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.A, batch_size),
-    #     )
-    #     lb = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.lb, batch_size),
-    #     )
-    #     ub = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.ub, batch_size),
-    #     )
-
-    #     solution = self.prog.run(
-    #         init_params=warmstart,
-    #         params_obj=(H, f),
-    #         params_eq=A,
-    #         params_ineq=(lb, ub),
-    #     )
-    #     return solution
-
-    def initialize_warmstart(
-        self,
-        init_x: jax.Array,
-        data: OptimizationData,
-    ) -> KKTSolution:
-        """Solve using OSQP Solver."""
-        # Format OptimizationData:
-        init_x = jnp.concatenate(init_x, axis=0)
-        H = jax.scipy.linalg.block_diag(*data.H)
-        f = jnp.concatenate(data.f, axis=0)
-        A = jax.scipy.linalg.block_diag(*data.A)
-        lb = jnp.concatenate(data.lb, axis=0)
-        ub = jnp.concatenate(data.ub, axis=0)
-
-        warmstart = self.prog.init_params(
-            init_x=init_x,
-            params_obj=(H, f),
-            params_eq=A,
-            params_ineq=(lb, ub),
-        )
-        return warmstart
-
-    def solve(
-        self,
-        data: OptimizationData,
-        warmstart: Optional[Any] = None,
-    ) -> OptStep:
-        """Solve using OSQP Solver."""
-        # Unpack OptimizationData to List:
-        H = jax.scipy.linalg.block_diag(*data.H)
-        f = jnp.concatenate(data.f, axis=0)
-        A = jax.scipy.linalg.block_diag(*data.A)
-        lb = jnp.concatenate(data.lb, axis=0)
-        ub = jnp.concatenate(data.ub, axis=0)
-
-        solution = self.prog.run(
-            init_params=warmstart,
-            params_obj=(H, f),
-            params_eq=A,
-            params_ineq=(lb, ub),
-        )
-        return solution
-
-    def motor_model(
-        self, u: jax.Array, q: jax.Array, qd: jax.Array,
-    ) -> jax.Array:
-        """Brax Motor Model."""
-        bias = self.actuator_gear[:, 0] * (
-            self.actuator_biasprm[:, 1] * q + self.actuator_biasprm[:, 2] * qd
-        )
-        return self.actuator_gear[:, 0] * (self.actuator_gainprm[:, 0] * u + bias)
+        return OptimizationData(H=H, f=f, A=A, b=b, G=G, h=h)
