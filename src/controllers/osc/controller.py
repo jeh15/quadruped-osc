@@ -13,6 +13,7 @@ from brax.base import System
 from mujoco.mjx._src.types import Model
 
 from src.controllers.osc.utilities import OSCData
+from jaxopt.base import KKTSolution
 
 
 @struct.dataclass
@@ -168,6 +169,14 @@ class OSCController:
             jit=self.osqp_config.jit,
             unroll=self.osqp_config.unroll,
         )
+
+        # Initialize Design Variables:
+        weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
+        self.init_x = jnp.concatenate([
+            jnp.zeros(self.dv_size),
+            jnp.zeros(self.u_size),
+            jnp.array([0, 0, weight / 4] * 4),
+        ])
 
         # Initialize Optimization Problem:
         self._initialize_optimization()
@@ -394,15 +403,67 @@ class OSCController:
 
         return OptimizationData(H=H, f=f, A=A, lb=lb, ub=ub)
 
+    def initialize_warmstart(
+        self,
+        data: OptimizationData,
+        batch_size: int = 1,
+    ) -> KKTSolution:
+        """Solve using OSQP Solver."""
+        # Unpack OptimizationData to List:
+        H = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.H, batch_size),
+        )
+        f = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.f, batch_size),
+        )
+        A = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.A, batch_size),
+        )
+        lb = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.lb, batch_size),
+        )
+        ub = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.ub, batch_size),
+        )
+        init_x = jnp.tile(self.init_x, (batch_size, 1))
+
+        warmstart = self.prog.init_params(
+            init_x=init_x,
+            params_obj=(H, f),
+            params_eq=A,
+            params_ineq=(lb, ub),
+        )
+        return warmstart
+
     def solve(
-        self, data: OptimizationData, warmstart: Optional[Any] = None,
+        self,
+        data: OptimizationData,
+        warmstart: Optional[Any] = None,
+        batch_size: int = 1,
     ) -> OptStep:
         """Solve using OSQP Solver."""
+        # Unpack OptimizationData to List:
+        H = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.H, batch_size),
+        )
+        f = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.f, batch_size),
+        )
+        A = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.A, batch_size),
+        )
+        lb = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.lb, batch_size),
+        )
+        ub = jax.tree.map(
+            lambda x: jnp.squeeze(x), jnp.split(data.ub, batch_size),
+        )
+
         solution = self.prog.run(
             init_params=warmstart,
-            params_obj=(data.H, data.f),
-            params_eq=data.A,
-            params_ineq=(data.lb, data.ub),
+            params_obj=(H, f),
+            params_eq=A,
+            params_ineq=(lb, ub),
         )
         return solution
 

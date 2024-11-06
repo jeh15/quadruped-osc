@@ -194,23 +194,7 @@ class UnitreeGo2Env(PipelineEnv):
         self.foot_radius = 0.022
         self.history_length = 15
         self.num_observations = 31
-
-        # Initialize OSC:
-        self.num_taskspace_targets = 5
-        self.osc_controller = controller.OSCController(
-            model=sys.mj_model,
-            num_contacts=4,
-            num_taskspace_targets=self.num_taskspace_targets,
-            use_motor_model=False,
-            osqp_config=OSQPConfig(
-                tol=1e-3,
-                maxiter=4000,
-                verbose=False,
-                jit=True,
-            ),
-        )
         self.body_ids = np.concatenate([self.base_body_idx, self.calf_body_idx])
-
 
     def sample_command(self, rng: jax.Array) -> jax.Array:
         forward_velocity_range = [-0.6, 1.5]
@@ -591,6 +575,16 @@ class UnitreeGo2Env(PipelineEnv):
 
     def _reward_termination(self, done: jax.Array, step: jax.Array) -> jax.Array:
         return done & (step < 500)
+
+    def taskspace_points(self, pipeline_state: State) -> jax.Array:
+        """ Returns world points of taskspace target bodies. """
+        # (num_envs, body_id, 3)
+        body_points = jnp.expand_dims(
+            pipeline_state.site_xpos[:, self.imu_site_idx], axis=1,
+        )
+        feet_points = pipeline_state.site_xpos[:, self.feet_site_idx]
+        points = jnp.concatenate([body_points, feet_points], axis=1)
+        return points
 
     def np_observation(
         self,
