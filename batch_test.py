@@ -28,6 +28,9 @@ jax.config.update('jax_enable_x64', True)
 # jax.config.update('jax_disable_jit', True)
 
 def main(argv):
+
+    jax.profiler.start_trace("/tmp/tensorboard")
+    
     xml_path = os.path.join(
         os.path.dirname(__file__),
         'models/unitree_go2/scene_mjx_torque.xml',
@@ -100,9 +103,9 @@ def main(argv):
     step_fn = jax.jit(jax.vmap(env_step, in_axes=(None, 0, 0)))
 
     # Number of Parallel Envs:
-    num_envs = 1024
-    batch_size = 256
-    num_minibatches = 4
+    num_envs = 64
+    batch_size = 8
+    num_minibatches = 8
 
     # Initialize OSC Controller:
     taskspace_targets = jnp.zeros((num_envs, 5, 6))
@@ -247,6 +250,8 @@ def main(argv):
     )
     final_state.q.block_until_ready()
     print(f"Time Elapsed: {time.time() - start_time}")
+
+    jax.profiler.stop_trace()
 
 
 if __name__ == '__main__':
