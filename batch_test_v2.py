@@ -21,15 +21,11 @@ from src.controllers.osc.controller import OptimizationData
 
 import time
 
-# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-
 jax.config.update('jax_enable_x64', True)
-# jax.config.update('jax_compiler_enable_remat_pass', False)
-# jax.config.update('jax_disable_jit', True)
 
 def main(argv):
 
-    jax.profiler.start_trace("/tmp/tensorboard")
+    # jax.profiler.start_trace("/tmp/tensorboard")
     
     xml_path = os.path.join(
         os.path.dirname(__file__),
@@ -124,10 +120,10 @@ def main(argv):
     )
 
     # JIT Controller Functions:
-    get_data_fn = jax.jit(jax.vmap(osc_utils.get_data, in_axes=(None, 0, 0, None)))
-    update_fn = jax.jit(jax.vmap(osc_controller.update, in_axes=(0, 0)))
-    warmstart_fn = jax.jit(osc_controller.initialize_warmstart)
-    solve_fn = jax.jit(osc_controller.solve)
+    get_data_fn = jax.vmap(osc_utils.get_data, in_axes=(None, 0, 0, None))
+    update_fn = jax.vmap(osc_controller.update, in_axes=(0, 0))
+    warmstart_fn = osc_controller.initialize_warmstart
+    solve_fn = osc_controller.solve
 
     # Initialize State:
     q_init = jnp.tile(q_init, (num_envs, 1))
@@ -140,8 +136,8 @@ def main(argv):
     feet_points = state.site_xpos[:, feet_ids]
     points = jnp.concatenate([body_points, feet_points], axis=1)
     body_ids = jnp.concatenate([base_id, calf_ids])
-    osc_data = get_data_fn(model, state, points, body_ids)
-    prog_data = update_fn(taskspace_targets, osc_data)
+    osc_data = jax.jit(get_data_fn)(model, state, points, body_ids)
+    prog_data = jax.jit(update_fn)(taskspace_targets, osc_data)
 
     weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
     init_x = jnp.concatenate([
@@ -177,16 +173,6 @@ def main(argv):
     num_control_steps = 10
 
     def loop(carry, xs):
-        # def batched_solve(carry, xs):
-        #     data, warmstart = xs
-        #     solution = solve_fn(data, warmstart)
-
-        #     primal = jnp.reshape(solution.params.primal[0], (batch_size, -1))
-        #     dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
-        #     warmstart = solution.params
-
-        #     return None, (u, warmstart)
-
         def batched_solve(xs):
             data, warmstart = xs
             solution = solve_fn(data, warmstart)
@@ -216,14 +202,7 @@ def main(argv):
             batched_data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), prog_data)
             batched_warmstart = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), warmstart)
 
-            # Solve: Using Scan...
-            # _, (u, next_warmstart) = jax.lax.scan(
-            #     f=batched_solve,
-            #     init=None,
-            #     xs=(batched_data, batched_warmstart),
-            # )
-
-            # Solve: Using jax.lax.map... This can also take a batch size...
+            # Solve:
             u, next_warmstart = jax.lax.map(
                 f=batched_solve,
                 xs=(batched_data, batched_warmstart),
@@ -240,7 +219,7 @@ def main(argv):
                 length=num_control_steps,
             )
 
-            return (next_state, next_warmstart), (next_state, next_warmstart)
+            return (next_state, next_warmstart), None
 
         # Unpack Carry:
         state, warmstart = carry
@@ -253,7 +232,7 @@ def main(argv):
             length=batch_size * num_minibatches // num_envs,
         )
 
-        return (next_state, next_warmstart), _
+        return (next_state, next_warmstart), None
 
     # Run Loop:
     initial_state = init_fn(model, q_init, qd_init)
