@@ -89,7 +89,7 @@ def main(argv):
     step_fn = jax.jit(pipeline.step)
 
     # Initialize OSC Controller:
-    taskspace_targets = jnp.zeros((5, 6))
+    taskspace_targets = jnp.zeros((num_envs, 5, 6))
     osc_controller = controller.OSCController(
         model=mj_model,
         num_contacts=4,

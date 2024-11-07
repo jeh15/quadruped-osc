@@ -8,6 +8,8 @@ import jax.numpy as jnp
 
 import mujoco
 from mujoco import mjx
+import brax
+from brax.io import mjcf, html
 from brax.mjx import pipeline
 
 from src.controllers.osc import utilities as osc_utils
@@ -22,11 +24,9 @@ from src.controllers.osc.controller import OptimizationData
 import time
 
 jax.config.update('jax_enable_x64', True)
+# jax.config.update('jax_disable_jit', True)
 
 def main(argv):
-
-    # jax.profiler.start_trace("/tmp/tensorboard")
-    
     xml_path = os.path.join(
         os.path.dirname(__file__),
         'models/unitree_go2/scene_mjx_torque.xml',
@@ -99,9 +99,13 @@ def main(argv):
     step_fn = jax.jit(jax.vmap(env_step, in_axes=(None, 0, 0)))
 
     # Number of Parallel Envs:
-    num_envs = 1024
-    batch_size = 32
-    num_minibatches = 32
+    # num_envs = 512
+    # batch_size = 256
+    # num_minibatches = 32
+
+    num_envs = 256
+    batch_size = 256
+    num_minibatches = 4
 
     # Initialize OSC Controller:
     taskspace_targets = jnp.zeros((num_envs, 5, 6))
@@ -199,19 +203,26 @@ def main(argv):
             prog_data = update_fn(taskspace_targets, osc_data)
 
             # Split into Batches:
-            batched_data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), prog_data)
-            batched_warmstart = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), warmstart)
+            # batched_data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), prog_data)
+            # batched_warmstart = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), warmstart)
 
-            # Solve:
-            u, next_warmstart = jax.lax.map(
-                f=batched_solve,
-                xs=(batched_data, batched_warmstart),
-            )
+            # # Batch Solve via lax.map:
+            # u, next_warmstart = jax.lax.map(
+            #     f=batched_solve,
+            #     xs=(batched_data, batched_warmstart),
+            # )
 
-            # Format Control and Warmstart:
-            u = jnp.concatenate(u, axis=0)
-            next_warmstart = jax.tree.map(lambda x: jnp.concatenate(x, axis=0), next_warmstart)
+            # # Format Control and Warmstart:
+            # u = jnp.concatenate(u, axis=0)
+            # next_warmstart = jax.tree.map(lambda x: jnp.concatenate(x, axis=0), next_warmstart)
 
+            # Solve: (OOM)
+            solution = solve_fn(prog_data, warmstart)
+            primal = jnp.reshape(solution.params.primal[0], (num_envs, -1))
+            dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
+            next_warmstart = solution.params
+
+            # Unroll Control Step:
             (next_state, _), _ = jax.lax.scan(
                 f=step_unroll,
                 init=(state, u),
@@ -236,9 +247,8 @@ def main(argv):
 
     # Run Loop:
     initial_state = init_fn(model, q_init, qd_init)
-    key = jax.random.key(0)
     start_time = time.time()
-    (final_state, _), _ = jax.lax.scan(
+    (final_state, _), states = jax.lax.scan(
         f=loop,
         init=(initial_state, warmstart),
         xs=None,
@@ -246,6 +256,42 @@ def main(argv):
     )
     final_state.q.block_until_ready()
     print(f"Time Elapsed: {time.time() - start_time}")
+
+    # Visualize:
+    state_list = []
+    num_steps = states.q.shape[0]
+    for i in range(num_steps):
+        state_list.append(
+            State(
+                q=states.q[i][0],
+                qd=states.qd[i][0],
+                x=brax.base.Transform(
+                    pos=states.x.pos[i][0],
+                    rot=states.x.rot[i][0],
+                ),
+                xd=brax.base.Motion(
+                    vel=states.xd.vel[i][0],
+                    ang=states.xd.ang[i][0],
+                ),
+                **data.__dict__,
+            ),
+        )
+
+    sys = mjcf.load_model(mj_model)
+    html_string = html.render(
+        sys=sys,
+        states=state_list,
+        height="100vh",
+        colab=False,
+    )
+
+    html_path = os.path.join(
+        os.path.dirname(__file__),
+        "visualization/visualization.html",
+    )
+
+    with open(html_path, "w") as f:
+        f.writelines(html_string)
 
 
 if __name__ == '__main__':
