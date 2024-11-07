@@ -157,7 +157,7 @@ def main(argv):
             x, data = xs
             warmstart = warmstart_fn(x, data)
             return None, warmstart
-        
+
         # Split into Batches:
         x = jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
         data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), data)
@@ -170,13 +170,24 @@ def main(argv):
 
         warmstart = jax.tree.map(lambda x: jnp.concatenate(x, axis=0), warmstart)
         return warmstart
-    
+
     warmstart = jax.jit(batch_warmstart)(init_x, prog_data)
-    
+
 
     num_control_steps = 10
+
     def loop(carry, xs):
-        def batched_solve(carry, xs):
+        # def batched_solve(carry, xs):
+        #     data, warmstart = xs
+        #     solution = solve_fn(data, warmstart)
+
+        #     primal = jnp.reshape(solution.params.primal[0], (batch_size, -1))
+        #     dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
+        #     warmstart = solution.params
+
+        #     return None, (u, warmstart)
+
+        def batched_solve(xs):
             data, warmstart = xs
             solution = solve_fn(data, warmstart)
 
@@ -184,7 +195,7 @@ def main(argv):
             dv, u, z = jnp.split(primal, [osc_controller.dv_idx, osc_controller.u_idx], axis=-1)
             warmstart = solution.params
 
-            return None, (u, warmstart)
+            return (u, warmstart)
 
         def step_unroll(carry, xs):
             state, ctrl = carry
@@ -204,11 +215,17 @@ def main(argv):
             # Split into Batches:
             batched_data = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), prog_data)
             batched_warmstart = jax.tree.map(lambda x: jnp.reshape(x, (num_minibatches, -1) + x.shape[1:]), warmstart)
-            
-            # Solve:
-            _, (u, next_warmstart) = jax.lax.scan(
+
+            # Solve: Using Scan...
+            # _, (u, next_warmstart) = jax.lax.scan(
+            #     f=batched_solve,
+            #     init=None,
+            #     xs=(batched_data, batched_warmstart),
+            # )
+
+            # Solve: Using jax.lax.map... This can also take a batch size...
+            u, next_warmstart = jax.lax.map(
                 f=batched_solve,
-                init=None,
                 xs=(batched_data, batched_warmstart),
             )
 
@@ -224,7 +241,7 @@ def main(argv):
             )
 
             return (next_state, next_warmstart), (next_state, next_warmstart)
-        
+
         # Unpack Carry:
         state, warmstart = carry
 
