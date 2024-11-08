@@ -8,7 +8,6 @@ from flax import struct, serialization
 from jaxopt import BoxOSQP
 from jaxopt.base import OptStep
 
-import mujoco
 from brax.base import System
 from mujoco.mjx._src.types import Model
 
@@ -75,14 +74,10 @@ class OSCController:
         weights_config: WeightConfig = WeightConfig(),
         osqp_config: OSQPConfig = OSQPConfig(),
         control_matrix: Optional[jax.Array] = None,
-        use_motor_model: bool = False,
         foot_radius: float = 0.02,
         friction_coefficient: float = 0.8,
     ):
         """ Operational Space Control (OSC) Controller for Quadruped."""
-        assert bool(use_motor_model and control_matrix) is False, (
-            "If using the motor model, the control matrix must be None."
-        )
         # Weight Configuration:
         self.weights_config: dict = serialization.to_state_dict(weights_config)
 
@@ -119,25 +114,14 @@ class OSCController:
         )
         self.torque_limits: jax.Array = model.actuator_forcerange
 
-        self.use_motor_model: bool = use_motor_model
+        self.default_ctrl: jax.Array = jnp.zeros((self.u_size,))
+
         self.B: jax.Array = jnp.concatenate(
             [jnp.zeros((6, self.u_size)), jnp.eye(self.u_size)],
             axis=0,
         )
-        self.default_ctrl: jax.Array = jnp.zeros((self.u_size,))
-        if self.use_motor_model:
-            # Actuation Model:
-            actuator_mask = model.actuator_trntype == mujoco.mjtTrn.mjTRN_JOINT
-            trnid = model.actuator_trnid[actuator_mask, 0]
-            self.actuator_q_id: jax.Array = model.jnt_qposadr[trnid]
-            self.actuator_qd_id: jax.Array = model.jnt_dofadr[trnid]
-            self.actuator_gear: jax.Array = model.actuator_gear
-            self.actuator_gainprm: jax.Array = model.actuator_gainprm
-            self.actuator_biasprm: jax.Array = model.actuator_biasprm
-            self.default_ctrl: jax.Array = jnp.array(model.keyframe('home').ctrl)
-        else:
-            if control_matrix is not None:
-                self.B: jax.Array = control_matrix
+        if control_matrix is not None:
+            self.B: jax.Array = control_matrix
 
         assert self.B.shape == (model.nv, self.u_size), (
             "Control matrix shape should be size (NV, NU)."
@@ -178,6 +162,9 @@ class OSCController:
             jnp.array([0, 0, weight / 4] * 4),
         ])
 
+        # Large number for constraint bounds that cannot be inf:
+        self.large_number: float = 1e4
+
         # Initialize Optimization Problem:
         self._initialize_optimization()
 
@@ -209,13 +196,6 @@ class OSCController:
         J_contact = data.contact_jacobian
 
         # Dynamics Constraint:
-        if self.use_motor_model:
-            u = self.motor_model(
-                u,
-                data.previous_q[self.actuator_q_id],
-                data.previous_qd[self.actuator_qd_id],
-            )
-
         dynamics = M @ dv + C - self.B @ u - J_contact @ z
 
         # Concatenate Constraints:
@@ -366,21 +346,15 @@ class OSCController:
         dv_lb = -jnp.inf * jnp.ones((self.dv_size,))
         dv_ub = jnp.inf * jnp.ones((self.dv_size,))
         # Control Input Bounds: u = [tau_fl, tau_fr, tau_hl, tau_hr]
-        if self.use_motor_model:
-            u_lb = jnp.array(self.ctrl_limits[:, 0])
-            u_ub = jnp.array(self.ctrl_limits[:, 1])
-        else:
-            u_lb = jnp.array(self.torque_limits[:, 0])
-            u_ub = jnp.array(self.torque_limits[:, 1])
+        u_lb = jnp.array(self.torque_limits[:, 0])
+        u_ub = jnp.array(self.torque_limits[:, 1])
         # Reaction Forces: z = [f_x, f_y, f_z, tau_x, tau_y, tau_z]
         z_lb = jnp.array(
             [-jnp.inf, -jnp.inf, 0.0] * 4,
         )
-        z_ub = jnp.array(
-            [jnp.inf, jnp.inf, jnp.inf] * 4,
-        )
         self.box_lb = jnp.concatenate([dv_lb, u_lb, z_lb])
-        self.box_ub = jnp.concatenate([dv_ub, u_ub, z_ub])
+        # Leave z_ub out of box constraints:
+        self.box_ub = jnp.concatenate([dv_ub, u_ub])
 
         # Inequality Constraints are constant:
         self.Aineq = self.Aineq_fn(self.q)
@@ -398,8 +372,16 @@ class OSCController:
         f = self.f_fn(self.q, taskspace_targets, data)
 
         A = jnp.concatenate([Aeq, self.Aineq, self.Abox])
+
+        # Foot Contact Constraints:
+        z_ub = jax.vmap(jnp.dot)(
+            jnp.array([[self.large_number, self.large_number, self.large_number]] * 4),
+            data.contact_mask,
+        ).flatten()
+        box_ub = jnp.concatenate([self.box_ub, z_ub])
+
         lb = jnp.concatenate([beq, self.bineq_lb, self.box_lb])
-        ub = jnp.concatenate([beq, self.bineq_ub, self.box_ub])
+        ub = jnp.concatenate([beq, self.bineq_ub, box_ub])
 
         return OptimizationData(H=H, f=f, A=A, lb=lb, ub=ub)
 
@@ -493,14 +475,22 @@ class OSCController:
         self,
         data: OptimizationData,
         warmstart: Optional[Any] = None,
+        parallel: bool = False,
     ) -> OptStep:
         """Solve using OSQP Solver."""
         # Unpack OptimizationData to List:
-        H = jax.scipy.linalg.block_diag(*data.H)
-        f = jnp.concatenate(data.f, axis=0)
-        A = jax.scipy.linalg.block_diag(*data.A)
-        lb = jnp.concatenate(data.lb, axis=0)
-        ub = jnp.concatenate(data.ub, axis=0)
+        if parallel:
+            H = jax.scipy.linalg.block_diag(*data.H)
+            f = jnp.concatenate(data.f, axis=0)
+            A = jax.scipy.linalg.block_diag(*data.A)
+            lb = jnp.concatenate(data.lb, axis=0)
+            ub = jnp.concatenate(data.ub, axis=0)
+        else:
+            H = data.H
+            f = data.f
+            A = data.A
+            lb = data.lb
+            ub = data.ub
 
         solution = self.prog.run(
             init_params=warmstart,
@@ -509,12 +499,3 @@ class OSCController:
             params_ineq=(lb, ub),
         )
         return solution
-
-    def motor_model(
-        self, u: jax.Array, q: jax.Array, qd: jax.Array,
-    ) -> jax.Array:
-        """Brax Motor Model."""
-        bias = self.actuator_gear[:, 0] * (
-            self.actuator_biasprm[:, 1] * q + self.actuator_biasprm[:, 2] * qd
-        )
-        return self.actuator_gear[:, 0] * (self.actuator_gainprm[:, 0] * u + bias)

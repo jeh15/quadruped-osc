@@ -16,6 +16,7 @@ class OSCData:
     contact_jacobian: jax.Array
     taskspace_jacobian: jax.Array
     taskspace_bias: jax.Array
+    contact_mask: jax.Array
     previous_q: jax.Array
     previous_qd: jax.Array
 
@@ -57,6 +58,9 @@ def get_data(
         axis=-1,
     )
 
+    # Contact Mask: (Less than milimeter)
+    contact_mask = data.contact.dist <= 1e-3
+
     # Pack Struct:
     return OSCData(
         mass_matrix=mass_matrix,
@@ -64,6 +68,7 @@ def get_data(
         contact_jacobian=contact_jacobian,
         taskspace_jacobian=taskspace_jacobian,
         taskspace_bias=taskspace_bias,
+        contact_mask=contact_mask,
         previous_q=data.qpos,
         previous_qd=data.qvel,
     )

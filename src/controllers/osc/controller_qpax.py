@@ -1,19 +1,14 @@
-from typing import Optional, Union, Callable, Any
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 
 from flax import struct, serialization
 
-from jaxopt import BoxOSQP
-from jaxopt.base import OptStep
-
-import mujoco
 from brax.base import System
 from mujoco.mjx._src.types import Model
 
 from src.controllers.osc.utilities import OSCData
-from jaxopt.base import KKTSolution
 
 
 @struct.dataclass
@@ -36,28 +31,6 @@ class WeightConfig:
 
 
 @struct.dataclass
-class OSQPConfig:
-    check_primal_dual_infeasability: str | bool = True
-    sigma: float = 1e-6
-    momentum: float = 1.6
-    eq_qp_solve: str = 'cg'
-    rho_start: float = 0.1
-    rho_min: float = 1e-6
-    rho_max: float = 1e6
-    stepsize_updates_frequency: int = 10
-    primal_infeasible_tol: float = 1e-3
-    dual_infeasible_tol: float = 1e-3
-    maxiter: int = 4000
-    tol: float = 1e-3
-    termination_check_frequency: int = 5
-    verbose: Union[bool, int] = 1
-    implicit_diff: bool = True
-    implicit_diff_solve: Optional[Callable] = None
-    jit: bool = True
-    unroll: str | bool = "auto"
-
-
-@struct.dataclass
 class OptimizationData:
     H: jax.Array
     f: jax.Array
@@ -65,6 +38,7 @@ class OptimizationData:
     b: jax.Array
     G: jax.Array
     h: jax.Array
+
 
 class OSCController:
     def __init__(
@@ -120,19 +94,16 @@ class OSCController:
         )
         if control_matrix is not None:
             self.B: jax.Array = control_matrix
-        
+
         assert self.B.shape == (model.nv, self.u_size), (
             "Control matrix shape should be size (NV, NU)."
         )
 
         self.default_ctrl: jax.Array = jnp.zeros((self.u_size,))
 
-
         # Utility Variables:
         self.num_contacts: int = num_contacts
         self.num_targets: int = num_taskspace_targets
-
-        # Initialize QP:
 
         # Initialize Design Variables:
         weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
@@ -141,6 +112,9 @@ class OSCController:
             jnp.zeros(self.u_size),
             jnp.array([0, 0, weight / 4] * 4),
         ])
+
+        # Large number for constraint bounds that cannot be inf:
+        self.large_number: float = 1e4
 
         # Initialize Optimization Problem:
         self._initialize_optimization()
@@ -329,15 +303,12 @@ class OSCController:
         z_lb = jnp.array(
             [-jnp.inf, -jnp.inf, 0.0] * 4,
         )
-        z_ub = jnp.array(
-            [jnp.inf, jnp.inf, jnp.inf] * 4,
-        )
         self.box_lb = jnp.concatenate([dv_lb, u_lb, z_lb])
-        self.box_ub = jnp.concatenate([dv_ub, u_ub, z_ub])
+        # Leave z_ub out of box constraints:
+        self.box_ub = jnp.concatenate([dv_ub, u_ub])
 
         # Box Constraints:
         self.Abox = jnp.concatenate([Abox, -Abox], axis=0)
-        self.hbox = jnp.concatenate([self.box_ub, -self.box_lb])
 
         # Inequality Constraints are constant:
         self.G = self.Aineq_fn(self.q)
@@ -353,7 +324,16 @@ class OSCController:
         H = self.H_fn(self.q, taskspace_targets, data)
         f = self.f_fn(self.q, taskspace_targets, data)
 
-        G = self.G
-        h = self.h
+        # Foot Contact Constraints:
+        z_ub = jax.vmap(jnp.dot)(
+            jnp.array([[self.large_number, self.large_number, self.large_number]] * 4),
+            data.contact_mask,
+        ).flatten()
+        box_ub = jnp.concatenate([self.box_ub, z_ub])
+        hbox = jnp.concatenate([box_ub, -self.box_lb])
+
+        # Inequality Constraints and Box Constraints:
+        G = jnp.concatenate([self.G, self.Abox], axis=0)
+        h = jnp.concatenate([self.h, hbox])
 
         return OptimizationData(H=H, f=f, A=A, b=b, G=G, h=h)

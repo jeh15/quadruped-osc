@@ -177,7 +177,6 @@ class UnitreeGo2Env(PipelineEnv):
         self.history_length = 15
         self.num_observations = 31
 
-
     def sample_command(self, rng: jax.Array) -> jax.Array:
         forward_velocity_range = [-0.6, 1.5]
         lateral_velocity_range = [-0.8, 0.8]
