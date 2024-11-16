@@ -1,0 +1,27 @@
+--- /dev/null
++++ BUILD.bazel
+@@ -0,0 +1,24 @@
++hdrs = glob(["include/**/*.h"])
++
++cc_import(
++    name = "lib_mujoco",
++    hdrs = hdrs,
++    includes = [
++        "include",
++    ],
++    shared_library = "lib/libmujoco.so.3.2.5",
++)
++
++cc_library(
++    name = "mujoco",
++    hdrs = hdrs,
++    includes = [
++        "include",
++    ],
++    deps = [
++        ":lib_mujoco",
++    ],
++    copts = ["-fPIC"],
++    linkopts = ["-pthread"],
++    visibility = ["//visibility:public"],
++)

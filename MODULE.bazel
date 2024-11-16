@@ -1,0 +1,41 @@
+""" 
+    Quadruped OSC Control
+"""
+
+module(
+    name = "quadruped",
+)
+
+# Mujoco Dependencies:
+bazel_dep(name = "mujoco_arm64")
+archive_override(
+    module_name = "mujoco_arm64",
+    urls = "https://github.com/google-deepmind/mujoco/releases/download/3.2.5/mujoco-3.2.5-linux-aarch64.tar.gz",
+    strip_prefix = "mujoco-3.2.5",
+    patches = [
+        "thirdparty/mujoco/arm64_module_dot_bazel.patch",
+        "thirdparty/mujoco/build_dot_bazel.patch",
+    ],
+    integrity = "sha256-LENvm2n4rD/OBtbrWQmZdYJFh9uA+4Uxy4fe+4+OpP4="
+)
+bazel_dep(name = "mujoco_amd64")
+archive_override(
+    module_name = "mujoco_amd64",
+    urls = "https://github.com/google-deepmind/mujoco/releases/download/3.2.5/mujoco-3.2.5-linux-x86_64.tar.gz",
+    strip_prefix = "mujoco-3.2.5",
+    patches = [
+        "thirdparty/mujoco/amd64_module_dot_bazel.patch",
+        "thirdparty/mujoco/build_dot_bazel.patch",
+    ],
+    integrity = "sha256-/jpQvMC5CijwZ1YcBagnRHtHkbX3YGHSg+MWLdHlJ8Q=",
+)
+
+# Autocomplete for Bazel:
+# Hedron's Compile Commands Extractor for Bazel
+# https://github.com/hedronvision/bazel-compile-commands-extractor
+bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
+git_override(
+    module_name = "hedron_compile_commands",
+    remote = "https://github.com/hedronvision/bazel-compile-commands-extractor.git",
+    commit = "4f28899228fb3ad0126897876f147ca15026151e",
+)
