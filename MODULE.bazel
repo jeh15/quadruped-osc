@@ -1,0 +1,37 @@
+""" 
+    Unitree Go2 Quadruped Module
+"""
+
+module(
+    name = "quadruped",
+)
+
+# Platforms:
+bazel_dep(name = "platforms", version = "0.0.10")
+
+# Python Rules:
+bazel_dep(name = "rules_python", version = "1.0.0")
+
+# Unitree API:
+bazel_dep(name = "unitree-bazel")
+git_override(
+    module_name = "unitree-bazel",
+    remote = "https://github.com/jeh15/unitree-bazel.git",
+    commit = "348d3001d729763891854d5743c6dc4c9abd9f6a",
+)
+
+# Python Toolchain:
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    configure_coverage_tool = True,
+    python_version = "3.12",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    download_only = True,
+    hub_name = "pypi",
+    python_version = "3.12",
+    requirements_lock = "//tests:requirements.txt",
+)
+use_repo(pip, "pypi")

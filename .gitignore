@@ -248,3 +248,6 @@ checkpoints/*
 
 # SVG files
 *.svg
+
+# Custom Data Folder:
+data/*
