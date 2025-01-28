@@ -1,3 +1,0 @@
-import jax
-
-jax.devices()
