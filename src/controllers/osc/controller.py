@@ -181,10 +181,6 @@ class OSCController:
             Dynamics:
             M @ dv + C - B @ u - J_contact.T @ z = 0
 
-            # ZMP Constraints:
-            tau_feet = r_feet->com x f_feet
-            sum(tau_feet) = M @ dw_com
-
         """
         # Unpack Design Variables:
         dv, u, z = jnp.split(
@@ -292,22 +288,22 @@ class OSCController:
             ),
             'fr_translational_tracking': self._objective_tracking(
                 ddx_fr[:3], ddx_fr_t[:3],
-                ),
+            ),
             'fr_rotational_tracking': self._objective_tracking(
                 ddx_fr[3:], ddx_fr_t[3:],
-                ),
+            ),
             'hl_translational_tracking': self._objective_tracking(
                 ddx_hl[:3], ddx_hl_t[:3],
-                ),
+            ),
             'hl_rotational_tracking': self._objective_tracking(
                 ddx_hl[3:], ddx_hl_t[3:],
-                ),
+            ),
             'hr_translational_tracking': self._objective_tracking(
                 ddx_hr[:3], ddx_hr_t[:3],
-                ),
+            ),
             'hr_rotational_tracking': self._objective_tracking(
                 ddx_hr[3:], ddx_hr_t[3:],
-                ),
+            ),
             'torque': self._objective_regularization(u),
             'regularization': self._objective_regularization(q),
         }
@@ -384,70 +380,6 @@ class OSCController:
         ub = jnp.concatenate([beq, self.bineq_ub, box_ub])
 
         return OptimizationData(H=H, f=f, A=A, lb=lb, ub=ub)
-
-    # def initialize_warmstart(
-    #     self,
-    #     data: OptimizationData,
-    #     batch_size: int = 1,
-    # ) -> KKTSolution:
-    #     """Solve using OSQP Solver."""
-    #     # Unpack OptimizationData to List:
-    #     H = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.H, batch_size),
-    #     )
-    #     f = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.f, batch_size),
-    #     )
-    #     A = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.A, batch_size),
-    #     )
-    #     lb = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.lb, batch_size),
-    #     )
-    #     ub = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.ub, batch_size),
-    #     )
-    #     init_x = jnp.tile(self.init_x, (batch_size, 1))
-
-    #     warmstart = self.prog.init_params(
-    #         init_x=init_x,
-    #         params_obj=(H, f),
-    #         params_eq=A,
-    #         params_ineq=(lb, ub),
-    #     )
-    #     return warmstart
-
-    # def solve(
-    #     self,
-    #     data: OptimizationData,
-    #     warmstart: Optional[Any] = None,
-    #     batch_size: int = 1,
-    # ) -> OptStep:
-    #     """Solve using OSQP Solver."""
-    #     # Unpack OptimizationData to List:
-    #     H = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.H, batch_size),
-    #     )
-    #     f = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.f, batch_size),
-    #     )
-    #     A = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.A, batch_size),
-    #     )
-    #     lb = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.lb, batch_size),
-    #     )
-    #     ub = jax.tree.map(
-    #         lambda x: jnp.squeeze(x), jnp.split(data.ub, batch_size),
-    #     )
-
-    #     solution = self.prog.run(
-    #         init_params=warmstart,
-    #         params_obj=(H, f),
-    #         params_eq=A,
-    #         params_ineq=(lb, ub),
-    #     )
-    #     return solution
 
     def initialize_warmstart(
         self,
