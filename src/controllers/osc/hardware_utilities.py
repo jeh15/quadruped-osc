@@ -1,5 +1,7 @@
 from unitree_bindings import unitree_api
 
+import time
+
 import jax
 import jax.numpy as jnp
 from flax import struct
@@ -58,6 +60,11 @@ def get_robot_state(
     body_acceleration = np.asarray(imu_state.accelerometer)
     foot_contacts = np.asarray(low_state.foot_force)[convert_foot_idx]
 
+    # Debug....
+    motor_velocity = np.zeros_like(motor_velocity)
+    # body_rotation = np.array([1, 0, 0, 0])
+    # body_velocity = np.zeros_like(body_velocity)
+
     return RobotState(
         motor_position=motor_position,
         motor_velocity=motor_velocity,
@@ -76,7 +83,7 @@ def get_data(
     points: jax.Array,
     body_ids: jax.Array,
     assume_contact: bool = False,
-) -> OSCData:
+) -> tuple[OSCData, Data]:
     """Update MJX Model and Data or Brax System and State (MJX Pipeline)."""
     # Update Data:
     q = jnp.concatenate(
@@ -127,7 +134,6 @@ def get_data(
     contact_mask = robot_state.foot_contacts <= 24.0
     contact_mask = jax.lax.select(assume_contact, jnp.ones_like(contact_mask), contact_mask)
 
-    # Pack Struct:
     return OSCData(
         mass_matrix=mass_matrix,
         coriolis_matrix=coriolis_matrix,
@@ -144,18 +150,26 @@ def update_mj_data(
     model: Model | System,
     data: Data | State,
     robot_state: RobotState,
+    fixed_base: bool = False,
 ) -> Data:
     """Update MJX Model and Data or Brax System and State (MJX Pipeline)."""
     # Update Data:
-    q = jnp.concatenate(
-        [jnp.array([0.0, 0.0, 0.0]), robot_state.body_rotation, robot_state.motor_position]
-    )
-    qd = jnp.concatenate(
-        [jnp.array([0.0, 0.0, 0.0]), robot_state.body_velocity, robot_state.motor_velocity]
-    )
-    data = data.replace(
-        qpos=q, qvel=qd, ctrl=jnp.zeros(shape=(12,)),
-    )
+    if not fixed_base:
+        q = jnp.concatenate(
+            [jnp.array([0.0, 0.0, 0.0]), robot_state.body_rotation, robot_state.motor_position]
+        )
+        qd = jnp.concatenate(
+            [jnp.array([0.0, 0.0, 0.0]), robot_state.body_velocity, robot_state.motor_velocity]
+        )
+        data = data.replace(
+            qpos=q, qvel=qd, ctrl=jnp.zeros(shape=(12,)),
+        )
+    else:
+        q = jnp.asarray(robot_state.motor_position)
+        qd = jnp.asarray(robot_state.motor_velocity)
+        data = data.replace(
+            qpos=q, qvel=qd, ctrl=jnp.zeros(shape=(12,)),
+        )
 
     # Forward Dynamics:
     data = mjx.forward(model, data)
@@ -163,57 +177,96 @@ def update_mj_data(
     return data
 
 
-# def get_data(
-#     model: Model | System,
-#     data: Data | State,
-#     robot_state: RobotState,
-#     points: jax.Array,
-#     body_ids: jax.Array,
-#     ignore_contacts: bool = False,
-# ) -> OSCData:
-#     """Get OSC data from MJX Model and Data or Brax System and State (MJX Pipeline)."""
-#     # Mass Matrix:
-#     mass_matrix = data.qM
+def default_position(unitree: unitree_api.MotorController, trajectory_length: int = 200) -> None:
+    def reset_position(current_postion: list[float],) -> list[float]:
+        defualt_ctrl = np.asarray([0.0, 0.9, -1.8] * 4)
+        ctrl_trajectory = np.linspace(current_postion, defualt_ctrl, trajectory_length, axis=0)
+        # Saturate Control Input:
+        lb = np.asarray([
+            -1.0472, -1.5708, -2.7227,
+            -1.0472, -1.5708, -2.7227,
+            -1.0472, -0.5236, -2.7227,
+            -1.0472, -0.5236, -2.7227,
+        ])
+        ub = np.asarray([
+            1.0472, 3.4907, -0.83776,
+            1.0472, 3.4907, -0.83776,
+            1.0472, 4.5379, -0.83776,
+            1.0472, 4.5379, -0.83776,
+        ])
+        ctrl_trajectory = np.fromiter(
+            iter=map(lambda x: np.clip(x, lb, ub), ctrl_trajectory),
+            dtype=np.dtype((float, 12)),
+        )
+        return ctrl_trajectory.tolist()
+    # Initialize Motor Command:
+    cmd = unitree_api.MotorCommand()
+    cmd.stiffness = [120.0] * 12
+    cmd.damping = [5.0] * 12
+    cmd.kp = [10.0] * 12
+    cmd.kd = [2.0] * 12
 
-#     # Coriolis Matrix:
-#     coriolis_matrix = data.qfrc_bias
+    # Get Robot State:
+    motor_state = unitree.get_motor_state()
 
-#     # Taskspace Jacobian:
-#     jacp_dot, jacr_dot = jax.vmap(
-#         math_utils.mj_jacobian_dot, in_axes=(None, None, 0, 0), out_axes=(0, 0),
-#     )(model, data, points, body_ids)
+    # Generate Trajectory to Default Position:
+    default_trajectory = reset_position(motor_state.q)
+    for ctrl in default_trajectory:
+        cmd.q_setpoint = ctrl
+        unitree.update_command(cmd)
+        time.sleep(0.02)
 
-#     # Jacobian Dot -> Shape: (num_body_ids, 6, NV)
-#     jacobian_dot = jnp.concatenate([jacp_dot, jacr_dot], axis=-2)
 
-#     # Taskspace Bias Acceleration -> Shape: (num_body_ids, 6)
-#     taskspace_bias = jacobian_dot @ data.qvel
-#     jacp, jacr = jax.vmap(
-#         math_utils.mj_jacobian, in_axes=(None, None, 0, 0), out_axes=(0, 0),
-#     )(model, data, points, body_ids)
+def get_osc_data(
+    model: Model | System,
+    data: Data | State,
+    robot_state: RobotState,
+    points: jax.Array,
+    body_ids: jax.Array,
+    assume_contact: bool = False,
+) -> OSCData:
+    """Get OSC data from MJX Model and Data or Brax System and State (MJX Pipeline)."""
+    # Mass Matrix:
+    mass_matrix = data.qM
 
-#     # Taskspace Jacobian -> Shape: (num_body_ids, 6, NV)
-#     taskspace_jacobian = jnp.concatenate([jacp, jacr], axis=-2)
+    # Coriolis Matrix:
+    coriolis_matrix = data.qfrc_bias
 
-#     # Contact Jacobian -> Shape: (num_contacts, NV, 3) -> (NV, 3 * num_contacts)
-#     # TODO(jeh15) Translational only:
-#     contact_jacobian = jnp.concatenate(
-#         jax.vmap(jnp.transpose)(taskspace_jacobian[1:])[:, :, :3],
-#         axis=-1,
-#     )
+    # Taskspace Jacobian:
+    jacp_dot, jacr_dot = jax.vmap(
+        math_utils.mj_jacobian_dot, in_axes=(None, None, 0, 0), out_axes=(0, 0),
+    )(model, data, points, body_ids)
 
-#     # Contact Mask: (Force threshold) -- Default no load value ~ 17.0 - 18.0
-#     contact_mask = robot_state.foot_contacts <= 24.0
-#     contact_mask = jax.lax.select(ignore_contacts, jnp.ones_like(contact_mask), contact_mask)
+    # Jacobian Dot -> Shape: (num_body_ids, 6, NV)
+    jacobian_dot = jnp.concatenate([jacp_dot, jacr_dot], axis=-2)
 
-#     # Pack Struct:
-#     return OSCData(
-#         mass_matrix=mass_matrix,
-#         coriolis_matrix=coriolis_matrix,
-#         contact_jacobian=contact_jacobian,
-#         taskspace_jacobian=taskspace_jacobian,
-#         taskspace_bias=taskspace_bias,
-#         contact_mask=contact_mask,
-#         previous_q=data.qpos,
-#         previous_qd=data.qvel,
-#     )
+    # Taskspace Bias Acceleration -> Shape: (num_body_ids, 6)
+    taskspace_bias = jacobian_dot @ data.qvel
+    jacp, jacr = jax.vmap(
+        math_utils.mj_jacobian, in_axes=(None, None, 0, 0), out_axes=(0, 0),
+    )(model, data, points, body_ids)
+
+    # Taskspace Jacobian -> Shape: (num_body_ids, 6, NV)
+    taskspace_jacobian = jnp.concatenate([jacp, jacr], axis=-2)
+
+    # Contact Jacobian -> Shape: (num_contacts, NV, 3) -> (NV, 3 * num_contacts)
+    # TODO(jeh15) Translational only:
+    contact_jacobian = jnp.concatenate(
+        jax.vmap(jnp.transpose)(taskspace_jacobian[1:])[:, :, :3],
+        axis=-1,
+    )
+
+    # Contact Mask: (Force threshold) -- Default no load value ~ 17.0 - 18.0
+    contact_mask = robot_state.foot_contacts <= 24.0
+    contact_mask = jax.lax.select(assume_contact, jnp.ones_like(contact_mask), contact_mask)
+
+    return OSCData(
+        mass_matrix=mass_matrix,
+        coriolis_matrix=coriolis_matrix,
+        contact_jacobian=contact_jacobian,
+        taskspace_jacobian=taskspace_jacobian,
+        taskspace_bias=taskspace_bias,
+        contact_mask=contact_mask,
+        previous_q=data.qpos,
+        previous_qd=data.qvel,
+    )

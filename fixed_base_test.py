@@ -12,11 +12,11 @@ import numpy as np
 
 import mujoco
 from mujoco import mjx
+import brax
 from brax.mjx import pipeline
 
 from src.controllers.osc import hardware_utilities as hardware_utils
-from src.controllers.osc import controller
-from src.controllers.osc.controller import OSQPConfig
+from src.controllers.osc.tests._fixed_base_controller import OSCController, OSQPConfig
 
 # Debug:
 from brax.io import mjcf, html
@@ -28,13 +28,10 @@ jax.config.update('jax_enable_x64', True)
 def main(argv):
     xml_path = os.path.join(
         os.path.dirname(__file__),
-        'models/unitree_go2/go2_mjx_osc.xml',
+        'models/unitree_go2/go2_mjx_fixed.xml',
     )
     # Mujoco model:
     mj_model = mujoco.MjModel.from_xml_path(xml_path)
-    q_init = jnp.asarray(mj_model.keyframe('home').qpos)
-    qd_init = jnp.asarray(mj_model.keyframe('home').qvel)
-    default_ctrl = jnp.asarray(mj_model.keyframe('home').ctrl)
 
     feet_site = [
         'front_left_foot',
@@ -47,19 +44,6 @@ def main(argv):
         for f in feet_site
     ]
     feet_ids = jnp.asarray(feet_site_ids)
-
-    imu_id = jnp.asarray(
-        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE.value, 'imu'),
-    )
-
-    base_body = [
-        'base_link',
-    ]
-    base_body_id = [
-        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_BODY.value, b)
-        for b in base_body
-    ]
-    base_id = jnp.asarray(base_body_id)
 
     calf_body = [
         'front_left_calf',
@@ -77,45 +61,17 @@ def main(argv):
     model = mjx.put_model(mj_model)
     data = mjx.make_data(model)
 
-    # Initialize MJX Data:
-    data = data.replace(
-        qpos=q_init, qvel=qd_init, ctrl=jnp.zeros_like(default_ctrl),
-    )
-    data = mjx.forward(model, data)
-
     # JIT Pipeline Functions:
     init_fn = jax.jit(pipeline.init)
 
     # Used to visualize for debugging:
     step_fn = jax.jit(pipeline.step)
 
-    # Initialize OSC Controller:
-    taskspace_targets = jnp.zeros((5, 6))
-    osc_controller = controller.OSCController(
-        model=mj_model,
-        num_contacts=4,
-        num_taskspace_targets=5,
-        osqp_config=OSQPConfig(
-            tol=1e-3,
-            maxiter=4000,
-            verbose=False,
-            jit=True,
-        ),
-    )
-
-    # JIT Controller Functions:
-    # get_data = functools.partial(hardware_utils.get_data, assume_contact=True)
-    # get_data_fn = jax.jit(get_data)
-
     # Separate functions:
-    update_mj_data = jax.jit(hardware_utils.update_mj_data)
+    update_mj_data = functools.partial(hardware_utils.update_mj_data, fixed_base=True)
+    update_mj_data_fn = jax.jit(update_mj_data)
     get_osc_data = functools.partial(hardware_utils.get_osc_data, assume_contact=False)
     get_osc_data_fn = jax.jit(get_osc_data)
-    
-    update_fn = jax.jit(osc_controller.update)
-    solve_fn = jax.jit(osc_controller.solve)
-
-    initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
 
     # Initialize Unitree Driver:
     network_name = "eno2"
@@ -140,26 +96,49 @@ def main(argv):
     print("Running Default Command and Holding Position.")
     time.sleep(1.0)
 
-    # Initialize Robot State:
-    init_robot_state = hardware_utils.get_robot_state(unitree_driver)
-    initial_data = hardware_utils.update_mj_data(model, initial_state, init_robot_state)
+    # Initialize mj_data:
+    initial_robot_state = hardware_utils.get_robot_state(unitree_driver)
+    q_initial = jnp.asarray(initial_robot_state.motor_position)
+    qd_initial = jnp.asarray(initial_robot_state.motor_velocity)
+    default_ctrl = jnp.zeros(12)
+
+    data = data.replace(
+        qpos=q_initial, qvel=qd_initial, ctrl=default_ctrl,
+    )
+    data = mjx.forward(model, data)
+
+    # Initialize OSC Controller:
+    taskspace_targets = jnp.zeros((4, 6))
+    osc_controller = OSCController(
+        model=mj_model,
+        num_taskspace_targets=4,
+        use_motor_model=False,
+        osqp_config=OSQPConfig(
+            check_primal_dual_infeasability=False,
+            tol=1e-3,
+            maxiter=4000,
+            verbose=False,
+            jit=True,
+        ),
+    )
+
+    update_fn = jax.jit(osc_controller.update)
+    solve_fn = jax.jit(osc_controller.solve)
+
+    # Record Initial Feet Positions:
+    initial_feet_positions = data.site_xpos[feet_ids]
 
     # Initialize Values and Warmstart:
-    body_points = jnp.expand_dims(initial_data.site_xpos[imu_id], axis=0)
-    feet_points = initial_data.site_xpos[feet_ids]
-    points = jnp.concatenate([body_points, feet_points])
-    body_ids = jnp.concatenate([base_id, calf_ids])
+    points = initial_feet_positions
+    body_ids = calf_ids
 
-    osc_data = get_osc_data_fn(model, initial_data, init_robot_state, points, body_ids)
-    # osc_data = get_data_fn(model, initial_data, init_robot_state, points, body_ids)
+    osc_data = get_osc_data_fn(model, data, initial_robot_state, points, body_ids)
 
     prog_data = update_fn(taskspace_targets, osc_data)
 
-    weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
     init_x = jnp.concatenate([
         jnp.zeros(osc_controller.dv_size),
         default_ctrl,
-        jnp.array([0, 0, weight / 4] * 4),
     ])
 
     warmstart = osc_controller.prog.init_params(
@@ -176,6 +155,10 @@ def main(argv):
 
     # Debugging:
     debug_states = []
+    robot_state = hardware_utils.get_robot_state(unitree_driver)
+    q = jnp.asarray(robot_state.motor_position)
+    qd = jnp.asarray(robot_state.motor_velocity)
+    state = init_fn(model, q=q, qd=qd, ctrl=jnp.zeros_like(default_ctrl))
 
     for i in range(num_iterations):
         # Start timer after functions are compiled:
@@ -184,17 +167,53 @@ def main(argv):
         # Get Robot State:
         robot_state = hardware_utils.get_robot_state(unitree_driver)
 
+        print(f"Robot Motor Positions: {robot_state.motor_position}")
+        print(f"Robot Motor Velocities: {robot_state.motor_velocity}")
+
         # Update mj_data:
-        data = update_mj_data(model, data, robot_state)
+        data = update_mj_data_fn(model, data, robot_state)
         
-        # Get Body and Feet Points:
-        body_points = np.expand_dims(data.site_xpos[imu_id], axis=0)
-        feet_points = data.site_xpos[feet_ids]
-        points = np.concatenate([body_points, feet_points])
-        body_ids = np.concatenate([base_id, calf_ids])
+        # Feet site position relative to calf body:
+        points = data.site_xpos[feet_ids]
+
+        # Feet site velocity: (This is correct compared to mujoco framelinvel sensor)
+        def feet_velocity_fn(data):
+            state = init_fn(model, q=data.qpos, qd=data.qvel, ctrl=data.ctrl)
+            relative_position = state.site_xpos[feet_ids] - state.xpos[calf_ids]
+            offset = brax.base.Transform.create(pos=relative_position)
+            foot_indices = calf_ids - 1
+            return offset.vmap().do(state.xd.take(foot_indices)).vel
+        
+        foot_velocities = jax.jit(feet_velocity_fn)(data)
 
         # Zero Acceleration Targets:
-        taskspace_targets = np.zeros((5, 6))
+        taskspace_targets = np.zeros((4, 6))
+
+        # Calculate Taskspace Targets: Circle
+        # kp = 1000
+        # kd = 10
+        # magnitude, frequency = 0.05, model.opt.timestep
+        # feet_position_targets = jax.vmap(lambda x: jnp.array([
+        #     magnitude * jnp.sin(frequency * i) + x[0],
+        #     x[1],
+        #     -magnitude * jnp.cos(frequency * i) + (x[2] + magnitude),
+        # ]))(initial_feet_positions)
+        # feet_velocity_targets = jnp.array([
+        #     magnitude * frequency * jnp.cos(frequency * i),
+        #     0.0,
+        #     magnitude * frequency * jnp.sin(frequency * i),
+        # ] * 4).reshape(4, 3)
+        # feet_acceleration_targets = jnp.array([
+        #     -magnitude * frequency**2 * jnp.sin(frequency * i),
+        #     0.0,
+        #     magnitude * frequency**2 * jnp.cos(frequency * i),
+        # ] * 4).reshape(4, 3)
+        # targets = feet_acceleration_targets + kp * (
+        #     feet_position_targets - data.site_xpos[feet_ids]
+        #     ) + kd * (feet_velocity_targets - foot_velocities)
+        # taskspace_targets = jnp.concatenate(
+        #     [targets, jnp.zeros((4, 3))], axis=-1,
+        # )
 
         # Get OSC Data:
         osc_data = get_osc_data_fn(model, data, robot_state, points, body_ids)
@@ -204,9 +223,9 @@ def main(argv):
 
         # Solve QP:
         solution = solve_fn(prog_data, warmstart)
-        dv, u, z = np.split(
+        dv, u = np.split(
             solution.params.primal[0],
-            [osc_controller.dv_idx, osc_controller.u_idx],
+            [osc_controller.dv_idx],
         )
         warmstart = solution.params
 
@@ -230,15 +249,8 @@ def main(argv):
         unitree_driver.update_command(cmd)
 
         # Generate Simulation View: (Debugging)
-        # q = jnp.concatenate(
-        #     [jnp.array([0.0, 0.0, 0.0]), robot_state.body_rotation, robot_state.motor_position]
-        # )
-        # qd = jnp.concatenate(
-        #     [jnp.array([0.0, 0.0, 0.0]), robot_state.body_velocity, robot_state.motor_velocity]
-        # )
-        # state = init_fn(model, q=q, qd=qd, ctrl=jnp.zeros_like(default_ctrl))
-        # simultation_state = step_fn(model, state, u)
-        # debug_states.append(simultation_state)
+        # state = step_fn(model, state, u)
+        # debug_states.append(state)
 
         # 50 Hz OSC Control Loop:
         execution_time = time.time() - start_time

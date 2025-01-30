@@ -177,9 +177,6 @@ def main(argv):
         xs=jnp.arange(num_steps),
     )
 
-    for i in range(num_steps):
-        print("Body Angular Velocity: ", states.qd[i][3:6])
-
     # Visualize:
     state_list = []
     num_steps = states.q.shape[0]
