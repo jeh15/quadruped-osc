@@ -21,6 +21,8 @@ from jaxopt.base import KKTSolution
 from brax.mjx.base import State
 import brax
 
+import pdb
+
 
 jax.config.update('jax_enable_x64', True)
 # jax.config.update('jax_disable_jit', True)
@@ -84,9 +86,6 @@ def main(argv):
     )
     data = mjx.forward(model, data)
 
-    # JIT Functions:
-    init_fn = jax.jit(pipeline.init)
-    step_fn = jax.jit(pipeline.step)
 
     # Initialize OSC Controller:
     taskspace_targets = jnp.zeros((5, 6))
@@ -107,111 +106,141 @@ def main(argv):
     update_fn = jax.jit(osc_controller.update)
     solve_fn = jax.jit(osc_controller.solve)
 
-    state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
-
     # Initialize Values and Warmstart:
-    num_steps = 5000
-    body_points = jnp.expand_dims(state.site_xpos[imu_id], axis=0)
-    feet_points = state.site_xpos[feet_ids]
+    body_points = jnp.expand_dims(data.site_xpos[imu_id], axis=0)
+    feet_points = data.site_xpos[feet_ids]
     points = jnp.concatenate([body_points, feet_points])
     body_ids = jnp.concatenate([base_id, calf_ids])
 
-    osc_data = get_data_fn(model, state, points, body_ids)
-
+    osc_data = get_data_fn(model, data, points, body_ids)
     prog_data = update_fn(taskspace_targets, osc_data)
 
-    weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
-    init_x = jnp.concatenate([
-        jnp.zeros(osc_controller.dv_size),
-        default_ctrl,
-        jnp.array([0, 0, weight / 4] * 4),
-    ])
+    Aeq = np.asarray(osc_controller.Aeq_fn(osc_controller.q, osc_data))
+    beq = np.asarray(-osc_controller.equality_constraints(osc_controller.q, osc_data))
+    M_ = osc_data.mass_matrix
+    C_ = osc_data.coriolis_matrix
+    Jc_ = osc_data.contact_jacobian
 
-    warmstart = osc_controller.prog.init_params(
-        init_x=init_x,
-        params_obj=(prog_data.H, prog_data.f),
-        params_eq=prog_data.A,
-        params_ineq=(prog_data.lb, prog_data.ub),
-    )
+    M = np.loadtxt("debug/M.csv", delimiter=",")
+    C = np.loadtxt("debug/C.csv", delimiter=",")
+    Jc = np.loadtxt("debug/Jc.csv", delimiter=",")
+    J = np.loadtxt("debug/J.csv", delimiter=",")
+    b = np.loadtxt("debug/b.csv", delimiter=",")
+    ddx_desired = np.loadtxt("debug/ddx_desired.csv", delimiter=",")
 
-    def loop(
-        carry: Tuple[State, KKTSolution, jax.Array], xs: jax.Array,
-    ) -> Tuple[Tuple[State, KKTSolution, jax.Array], State]:
-        state, warmstart, key = carry
-        key, subkey = jax.random.split(key)
 
-        # Get Body and Feet Points:
-        body_points = jnp.expand_dims(data.site_xpos[imu_id], axis=0)
-        feet_points = data.site_xpos[feet_ids]
-        points = jnp.concatenate([body_points, feet_points])
-        body_ids = jnp.concatenate([base_id, calf_ids])
+    print(f"A are equal: {np.allclose(A, Aeq, atol=1e-3)}")
+    print(f"b are equal: {np.allclose(b, beq, atol=1e-3)}")
+    print(f"M are equal: {np.allclose(M, M_, atol=1e-3)}")
+    print(f"C are equal: {np.allclose(C, C_, atol=1e-3)}")
+    print(f"Jc are equal: {np.allclose(Jc, Jc_, atol=1e-3)}")
 
-        # Zero Acceleration Targets:
-        taskspace_targets = jnp.zeros((5, 6))
+    print(f"As == Ad: {np.allclose(As, Ad, atol=1e-3)}")
+    print(f"Aeq == Ad: {np.allclose(Aeq, Ad, atol=1e-3)}")
+    print(f"Aeq == As: {np.allclose(Aeq, As, atol=1e-3)}")
 
-        # Get OSC Data
-        osc_data = get_data_fn(model, state, points, body_ids)
+    x = np.ones((42,))
+    Aeq_ = Aeq @ x - beq
+    As_ = As @ x - b
+    Ad_ = Ad @ x - b
+    print(f"Aeq @ x - beq == 0: {np.allclose(Aeq_, np.zeros_like(Aeq_), atol=1e-3)}")
+    print(f"As @ x - b == 0: {np.allclose(As_, np.zeros_like(As_), atol=1e-3)}")
+    print(f"Ad @ x - b == 0: {np.allclose(Ad_, np.zeros_like(Ad_), atol=1e-3)}")
 
-        # Update QP:
-        prog_data = update_fn(taskspace_targets, osc_data)
+    pdb.set_trace()
 
-        # Solve QP:
-        solution = solve_fn(prog_data, warmstart)
-        dv, u, z = jnp.split(
-            solution.params.primal[0],
-            [osc_controller.dv_idx, osc_controller.u_idx],
-        )
-        warmstart = solution.params
+    # weight = jnp.linalg.norm(model.opt.gravity) * jnp.sum(model.body_mass)
+    # init_x = jnp.concatenate([
+    #     jnp.zeros(osc_controller.dv_size),
+    #     default_ctrl,
+    #     jnp.array([0, 0, weight / 4] * 4),
+    # ])
 
-        # Step Simulation:
-        state = step_fn(model, state, u)
+    # warmstart = osc_controller.prog.init_params(
+    #     init_x=init_x,
+    #     params_obj=(prog_data.H, prog_data.f),
+    #     params_eq=prog_data.A,
+    #     params_ineq=(prog_data.lb, prog_data.ub),
+    # )
 
-        return (state, warmstart, subkey), state
+    # def loop(
+    #     carry: Tuple[State, KKTSolution, jax.Array], xs: jax.Array,
+    # ) -> Tuple[Tuple[State, KKTSolution, jax.Array], State]:
+    #     state, warmstart, key = carry
+    #     key, subkey = jax.random.split(key)
 
-    # Run Loop:
-    initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
-    key = jax.random.key(0)
-    (final_state, _, _), states = jax.lax.scan(
-        f=loop,
-        init=(initial_state, warmstart, key),
-        xs=jnp.arange(num_steps),
-    )
+    #     # Get Body and Feet Points:
+    #     body_points = jnp.expand_dims(data.site_xpos[imu_id], axis=0)
+    #     feet_points = data.site_xpos[feet_ids]
+    #     points = jnp.concatenate([body_points, feet_points])
+    #     body_ids = jnp.concatenate([base_id, calf_ids])
 
-    # Visualize:
-    state_list = []
-    num_steps = states.q.shape[0]
-    for i in range(num_steps):
-        state_list.append(
-            State(
-                q=states.q[i],
-                qd=states.qd[i],
-                x=brax.base.Transform(
-                    pos=states.x.pos[i],
-                    rot=states.x.rot[i],
-                ),
-                xd=brax.base.Motion(
-                    vel=states.xd.vel[i],
-                    ang=states.xd.ang[i],
-                ),
-                **data.__dict__,
-            ),
-        )
+    #     # Zero Acceleration Targets:
+    #     taskspace_targets = jnp.zeros((5, 6))
 
-    sys = mjcf.load_model(mj_model)
-    html_string = html.render(
-        sys=sys,
-        states=state_list,
-        height="100vh",
-        colab=False,
-    )
+    #     # Get OSC Data
+    #     osc_data = get_data_fn(model, state, points, body_ids)
 
-    html_path = os.path.join(
-        os.path.dirname(__file__),
-        "visualization/visualization.html",
-    )
+    #     # Update QP:
+    #     prog_data = update_fn(taskspace_targets, osc_data)
 
-    with open(html_path, "w") as f:
-        f.writelines(html_string)
+    #     # Solve QP:
+    #     solution = solve_fn(prog_data, warmstart)
+    #     dv, u, z = jnp.split(
+    #         solution.params.primal[0],
+    #         [osc_controller.dv_idx, osc_controller.u_idx],
+    #     )
+    #     warmstart = solution.params
+
+    #     # Step Simulation:
+    #     state = step_fn(model, state, u)
+
+    #     return (state, warmstart, subkey), state
+
+    # # Run Loop:
+    # initial_state = init_fn(model, q=q_init, qd=qd_init, ctrl=default_ctrl)
+    # key = jax.random.key(0)
+    # (final_state, _, _), states = jax.lax.scan(
+    #     f=loop,
+    #     init=(initial_state, warmstart, key),
+    #     xs=jnp.arange(num_steps),
+    # )
+
+    # # Visualize:
+    # state_list = []
+    # num_steps = states.q.shape[0]
+    # for i in range(num_steps):
+    #     state_list.append(
+    #         State(
+    #             q=states.q[i],
+    #             qd=states.qd[i],
+    #             x=brax.base.Transform(
+    #                 pos=states.x.pos[i],
+    #                 rot=states.x.rot[i],
+    #             ),
+    #             xd=brax.base.Motion(
+    #                 vel=states.xd.vel[i],
+    #                 ang=states.xd.ang[i],
+    #             ),
+    #             **data.__dict__,
+    #         ),
+    #     )
+
+    # sys = mjcf.load_model(mj_model)
+    # html_string = html.render(
+    #     sys=sys,
+    #     states=state_list,
+    #     height="100vh",
+    #     colab=False,
+    # )
+
+    # html_path = os.path.join(
+    #     os.path.dirname(__file__),
+    #     "visualization/visualization.html",
+    # )
+
+    # with open(html_path, "w") as f:
+    #     f.writelines(html_string)
 
 
 if __name__ == '__main__':

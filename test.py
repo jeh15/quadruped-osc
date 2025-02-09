@@ -61,15 +61,8 @@ def main(argv):
     data.ctrl = default_ctrl
 
     # Minimal Steps:
-    mujoco.mj_kinematics(mj_model, data)
-    mujoco.mj_comPos(mj_model, data)
-    mujoco.mj_comVel(mj_model, data)
+    mujoco.mj_forward(mj_model, data)
     
-    jacp = np.zeros((1,))
-    jacr = np.zeros((1,))
-
-    mj_jacobian = functools.partial(mujoco.mj_jac, model=mj_model, data=data)
-    np.vectorize(mj_jacobian)(jacp, jacr, points, body_ids)
 
 if __name__ == '__main__':
     app.run(main)

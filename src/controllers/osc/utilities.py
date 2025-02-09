@@ -1,72 +1,59 @@
-import numpy as np
-import numpy.typing as npt
-
+import jax
+import jax.numpy as jnp
 from flax import struct
-
-import mujoco
 
 from brax.base import System
 from brax.mjx.base import State
 from mujoco.mjx._src.types import Model, Data
 
+import src.math_utilities as math_utils
+
 
 @struct.dataclass
 class OSCData:
-    mass_matrix: npt.ArrayLike
-    coriolis_matrix: npt.ArrayLike
-    contact_jacobian: npt.ArrayLike
-    taskspace_jacobian: npt.ArrayLike
-    taskspace_bias: npt.ArrayLike
-    contact_mask: npt.ArrayLike
-    previous_q: npt.ArrayLike
-    previous_qd: npt.ArrayLike
+    mass_matrix: jax.Array
+    coriolis_matrix: jax.Array
+    contact_jacobian: jax.Array
+    taskspace_jacobian: jax.Array
+    taskspace_bias: jax.Array
+    contact_mask: jax.Array
+    previous_q: jax.Array
+    previous_qd: jax.Array
 
 
 def get_data(
     model: Model | System,
     data: Data | State,
-    points: npt.ArrayLike,
-    body_ids: npt.ArrayLike,
+    points: jax.Array,
+    body_ids: jax.Array,
 ) -> OSCData:
-    """Get OSC data from Mujoco Model and Data."""
+    """Get OSC data from MJX Model and Data or Brax System and State (MJX Pipeline)."""
     # Mass Matrix:
     mass_matrix = data.qM
 
     # Coriolis Matrix:
     coriolis_matrix = data.qfrc_bias
 
-    # Taskspace Jacobians:
-
-    mujoco.mj_jac(
-        model,
-        data,
-        jacp,
-        jacr,
-        points,
-        body_ids,
-    )
-
-    mujoco.mj_jacDot(
-        model,
-        data,
-        jacp_dot,
-        jacr_dot,
-        points,
-        body_ids,
-    )
-
-    # Taskspace Jacobian -> Shape: (num_body_ids, 6, NV)
-    taskspace_jacobian = np.concatenate([jacp, jacr], axis=-2)
+    # Taskspace Jacobian:
+    jacp_dot, jacr_dot = jax.vmap(
+        math_utils.mj_jacobian_dot, in_axes=(None, None, 0, 0), out_axes=(0, 0),
+    )(model, data, points, body_ids)
 
     # Jacobian Dot -> Shape: (num_body_ids, 6, NV)
-    jacobian_dot = np.concatenate([jacp_dot, jacr_dot], axis=-2)
+    jacobian_dot = jnp.concatenate([jacp_dot, jacr_dot], axis=-2)
 
     # Taskspace Bias Acceleration -> Shape: (num_body_ids, 6)
     taskspace_bias = jacobian_dot @ data.qvel
+    jacp, jacr = jax.vmap(
+        math_utils.mj_jacobian, in_axes=(None, None, 0, 0), out_axes=(0, 0),
+    )(model, data, points, body_ids)
+
+    # Taskspace Jacobian -> Shape: (num_body_ids, 6, NV)
+    taskspace_jacobian = jnp.concatenate([jacp, jacr], axis=-2)
 
     # Contact Jacobian -> Shape: (num_contacts, NV, 3) -> (NV, 3 * num_contacts)
     # TODO(jeh15) Translational only:
-    contact_jacobian = np.concatenate(
+    contact_jacobian = jnp.concatenate(
         jax.vmap(jnp.transpose)(taskspace_jacobian[1:])[:, :, :3],
         axis=-1,
     )
